@@ -1,4 +1,4 @@
-# R/modules/data_handling/input_processor.R
+# R/modules/data_handling/download_processor.R
 
 library(UCSCXenaTools)
 library(dplyr)

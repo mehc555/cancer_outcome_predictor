@@ -1,7 +1,7 @@
 # R/main.R
 
 # Source required modules
-source("R/modules/data_handling/input_processor.R")
+source("R/modules/data_handling/download_processor.R")
 source("R/modules/data_handling/cnv_processor.R")
 source("R/modules/data_handling/clinical_processor.R")
 source("R/modules/data_handling/expression_processor.R")
@@ -72,26 +72,20 @@ main <- function() {
         # Process CNV data
         message("\nProcessing CNV data...")
         
-	processed_data[[cancer_type]]$cnv <- process_cnv_data(cancer_type, preprocessing_method = "raw")
+	#processed_data[[cancer_type]]$cnv <- process_cnv_data(cancer_type, preprocessing_method = "raw")
         
         # Process clinical data with common features
 
 	message("\nProcessing clinical data...")
-        processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type, common_features = common_clinical_features, 
-									impute = FALSE, impute_method = "missing_category")
+        #processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type, common_features = common_clinical_features, impute = FALSE, impute_method = "missing_category")
         
         # Process expression data
         message("\nProcessing expression data...")
-        #processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type)
+        processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, min_tpm = 1, min_samples = 3)
     }
     
     return(processed_data)
 }
 
-if (sys.nframe() == 0) {
-    # Run the main function
-    processed_data <- main()
-    
-    # Print structure of processed data
-    #str(processed_data, max.level = 2)
-}
+# Run the main function
+processed_data <- main()
