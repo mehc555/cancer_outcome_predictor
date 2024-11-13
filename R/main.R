@@ -6,6 +6,8 @@ source("R/modules/data_handling/cnv_processor.R")
 source("R/modules/data_handling/clinical_processor.R")
 source("R/modules/data_handling/expression_processor.R")
 source("R/modules/data_handling/mutation_processor.R")
+source("R/modules/data_handling/methylation_processor.R")
+source("R/modules/data_handling/mirna_processor.R")
 set.seed(123)
 
 #' Get common columns across all cancer types, excluding all-NA columns
@@ -55,8 +57,8 @@ get_common_clinical_features <- function(cancer_types, base_dir = "data/GDC_TCGA
 
 main <- function() {
     # Define cancer types
-    cancer_types <- c("BRCA", "COAD", "LUAD")
-    #cancer_types <- c("BRCA")
+    #cancer_types <- c("BRCA", "COAD", "LUAD")
+    cancer_types <- c("BRCA")
 
     # Download TCGA data if needed
     # download_tcga_data() 
@@ -69,7 +71,8 @@ main <- function() {
     processed_data <- list()
     
     for (cancer_type in cancer_types) {
-        message(sprintf("\nProcessing data for %s:", cancer_type))
+
+        message(sprintf("\nProcessing data for %s:", cancer_type))        
         
         # Process CNV data
         message("\nProcessing CNV data...")
@@ -80,13 +83,19 @@ main <- function() {
         #processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type, common_features = common_clinical_features, impute = FALSE, impute_method = "missing_category")
         
         # Process expression data
-        message("\nProcessing expression data...")
+        message("\nProcessing gene expression data...")
         #processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, min_tpm = 1, min_samples = 3)
 
 	# Process mutation data
 	message("\nProcessing mutation data...")
-	processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, min_freq = 0.01)
+	#processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, min_freq = 0.01)
     
+        message("\nProcessing methylation data...")
+        #processed_data[[cancer_type]]$methylation <- process_methylation_data(cancer_type)
+
+	message("\nProcessing mirna expression data...")
+        processed_data[[cancer_type]]$mirna <- process_mirna_data(cancer_type)
+
     }
     
     return(processed_data)
