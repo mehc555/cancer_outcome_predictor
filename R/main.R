@@ -42,8 +42,7 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     
     if (file.exists(data_files$expression)) {
         data_list$expression <- read_tsv(data_files$expression, show_col_types = FALSE)
-        # Expression data is transposed, get column names except first (Ensembl_ID)
-        data_list$expression_samples <- colnames(data_list$expression)[-1]
+        data_list$expression_samples <- data_list$sample_id
     }
     
     if (file.exists(data_files$clinical)) {
@@ -95,7 +94,7 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     
     if (!is.null(data_list$expression)) {
         filtered_data$expression <- data_list$expression %>%
-            select(Ensembl_ID, all_of(common_samples))
+            filter(sample_id %in% common_samples)
     }
     
     if (!is.null(data_list$clinical)) {
@@ -110,11 +109,7 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     
     # Verify all filtered datasets have the same number of samples
     sample_counts <- sapply(filtered_data, function(df) {
-        if ("Ensembl_ID" %in% colnames(df)) {
-            return(ncol(df) - 1)  # Subtract 1 for Ensembl_ID column
-        } else {
             return(nrow(df))
-        }
     })
     
     if (length(unique(sample_counts)) != 1) {
@@ -126,7 +121,7 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     return(filtered_data)
 }
 
-#' Convert processed data to torch datasets
+#' Convert processed data to torch datasets with uniform handling
 #' @param processed_data List of processed data frames
 #' @param config Model configuration
 #' @return List of torch datasets
@@ -135,36 +130,54 @@ create_torch_datasets <- function(processed_data, config) {
     
     for (modality in names(processed_data)) {
         if (!is.null(processed_data[[modality]])) {
-            if (modality == "expression") {
-                # Handle transposed expression data
-                data_tensor <- torch_tensor(
-                    as.matrix(processed_data[[modality]][,-1]), 
-                    dtype = torch_float32()
-                )
-                # Store gene IDs
-                torch_datasets[[paste0(modality, "_features")]] <- 
-                    processed_data[[modality]]$Ensembl_ID
+            # Remove identifier columns if present
+            id_cols <- c("sample_id", "sample", "Sample_ID")
+            cols_to_remove <- which(colnames(processed_data[[modality]]) %in% id_cols)
+            
+            if (length(cols_to_remove) > 0) {
+                data_matrix <- as.matrix(processed_data[[modality]][, -cols_to_remove])
             } else {
-                # Handle other modalities
-                data_tensor <- torch_tensor(
-                    as.matrix(processed_data[[modality]]), 
+                data_matrix <- as.matrix(processed_data[[modality]])
+            }
+            
+            # Convert to numeric matrix and handle NAs
+            data_matrix <- matrix(as.numeric(data_matrix), 
+                                nrow = nrow(data_matrix),
+                                ncol = ncol(data_matrix))
+            data_matrix[is.na(data_matrix)] <- 0
+            storage.mode(data_matrix) <- "double"
+            
+            # Create torch tensor with error handling
+            tryCatch({
+                torch_datasets[[modality]] <- torch_tensor(
+                    data_matrix,
                     dtype = torch_float32()
                 )
-            }
-            torch_datasets[[modality]] <- data_tensor
+                
+                # Store feature names
+                torch_datasets[[paste0(modality, "_features")]] <- colnames(data_matrix)
+                
+            }, error = function(e) {
+                stop(sprintf("Error converting %s to torch tensor: %s", 
+                           modality, e$message))
+            })
         }
     }
     
     return(torch_datasets)
 }
 
-main <- function() {
+main <- function(download=FALSE) {
     # Initialize project and load config
-    #if (!exists("config")) {
-    #    initialize_project()
-    #    config <- load_config()
-    #}
+    if (!exists("config")) {
+        initialize_project()
+        config <- load_config()
+    }
     
+    # Download data
+    if(!dowload) {
+    	download_tcga_data()
+    }
     # Define cancer types
     cancer_types <- c("BRCA", "COAD", "LUAD")
     base_dir <- "data/GDC_TCGA"
@@ -247,7 +260,5 @@ main <- function() {
     return(processed_data)
 }
 
-# Run the main function
-if (!interactive()) {
-    main()
-}
+main(download=FALSE)
+

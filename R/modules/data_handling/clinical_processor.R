@@ -44,7 +44,6 @@ get_cancer_features <- function(cancer_type) {
       "prior_malignancy" = "prior_malignancy.diagnoses",
       "prior_treatment" = "prior_treatment.diagnoses",
       "tumor_size_t" = "ajcc_pathologic_t.diagnoses",
-      "lymph_nodes_n" = "ajcc_pathologic_n.diagnoses",
       "metastasis_m" = "ajcc_pathologic_m.diagnoses",
       "tumor_type" = "tissue.type.samples"
     ),

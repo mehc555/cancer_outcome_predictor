@@ -75,10 +75,10 @@ validate_config <- function(config) {
   
   # Validate training config
   assertthat::assert_that(
-    !is.null(config$training$batch_size),
-    !is.null(config$training$max_epochs),
-    !is.null(config$training$optimizer$name),
-    !is.null(config$training$optimizer$lr)
+    !is.null(config$training$model$batch_size),
+    !is.null(config$training$model$max_epochs),
+    !is.null(config$training$model$optimizer$name),
+    !is.null(config$training$model$optimizer$lr)
   )
   
   return(TRUE)

@@ -13,6 +13,16 @@ create_processed_dir <- function(cancer_type, base_dir = "data/GDC_TCGA") {
   return(processed_dir)
 }
 
+#' Compute basic statistics for verification
+#' @param x Numeric vector
+#' @return Named vector with mean and sd
+#' @keywords internal
+compute_stats <- function(x) {
+  if(all(is.na(x))) return(c(mean = NA, sd = NA))
+  c(mean = mean(x, na.rm = TRUE), 
+    sd = sd(x, na.rm = TRUE))
+}
+
 #' Standardize expression matrix
 #' @param expression_df Data frame of expression values (without Ensembl_ID column)
 #' @return Standardized expression matrix
@@ -80,7 +90,7 @@ process_expression_data <- function(cancer_type, min_tpm = 1, min_samples = 3,
   filtered_genes <- nrow(expression_processed)
   removed_genes <- initial_genes - filtered_genes
   
-  # Validate the processed data
+  # Validate the expression data
   validate_expression_data(expression_processed)
   
   # Separate Ensembl IDs and expression values
@@ -90,28 +100,44 @@ process_expression_data <- function(cancer_type, min_tpm = 1, min_samples = 3,
   # Create standardized version
   standardized_values <- standardize_expression(expression_values)
   
-  expression_values=round(expression_values, 3)
-  standardized_values=round(standardized_values, 3)
-
-  # Add Ensembl IDs back to both versions
-  expression_processed <- bind_cols(
-    tibble(Ensembl_ID = ensembl_ids),
-    expression_values
-  )
+  # Verify standardization
+  message("\nVerifying standardization...")
+  # Check first gene
+  first_gene_stats <- compute_stats(as.numeric(standardized_values[1,]))
+  message(sprintf("First gene statistics after standardization:"))
+  message(sprintf("- Mean: %.6f (should be close to 0)", first_gene_stats["mean"]))
+  message(sprintf("- SD: %.6f (should be close to 1)", first_gene_stats["sd"]))
   
-  expression_standardized <- bind_cols(
-    tibble(Ensembl_ID = ensembl_ids),
-    standardized_values
-  )
+  # Check all genes
+  gene_stats <- t(apply(standardized_values, 1, compute_stats))
+  message("\nAll genes statistics:")
+  message(sprintf("Mean of gene means: %.6f", mean(gene_stats[,"mean"])))
+  message(sprintf("SD of gene means: %.6f", sd(gene_stats[,"mean"])))
+  message(sprintf("Mean of gene SDs: %.6f", mean(gene_stats[,"sd"])))
   
-
-
+  # Round values
+  expression_values <- round(expression_values, 3)
+  standardized_values <- round(standardized_values, 3)
+  
+  # Create final data frames with samples as rows
+  expression_final <- as.data.frame(t(expression_values)) %>%
+    rownames_to_column("sample_id")
+  colnames(expression_final)[-1] <- ensembl_ids
+  
+  standardized_final <- as.data.frame(t(standardized_values)) %>%
+    rownames_to_column("sample_id")
+  colnames(standardized_final)[-1] <- ensembl_ids
+  
+  # Clean up sample names
+  expression_final$sample_id <- gsub("\\.", "-", expression_final$sample_id)
+  standardized_final$sample_id <- gsub("\\.", "-", standardized_final$sample_id)
+  
   # Save both versions
-  write_tsv(expression_processed, output_file_log2)
-  write_tsv(expression_standardized, output_file_standardized)
+  write_tsv(expression_final, output_file_log2)
+  write_tsv(standardized_final, output_file_standardized)
   
   # Print processing summary
-  message(sprintf("Expression processing summary for %s:", cancer_type))
+  message(sprintf("\nExpression processing summary for %s:", cancer_type))
   message(sprintf("- Initial number of genes: %d", initial_genes))
   message(sprintf("- Removed %d genes (low expression/zero variance)", removed_genes))
   message(sprintf("- Retained %d genes", filtered_genes))
@@ -119,11 +145,15 @@ process_expression_data <- function(cancer_type, min_tpm = 1, min_samples = 3,
   message("- Transformations applied:")
   message("  1. log2(TPM + 0.1)")
   message("  2. Z-score standardization (saved separately)")
+  message("  3. Sample names cleaned (dots replaced with hyphens)")
+  message(sprintf("- Output saved to:"))
+  message(sprintf("  * Log2 transformed: %s", output_file_log2))
+  message(sprintf("  * Standardized: %s", output_file_standardized))
   
   # Return both versions in a list
   return(list(
-    log2_transformed = expression_processed,
-    standardized = expression_standardized
+    log2_transformed = expression_final,
+    standardized = standardized_final
   ))
 }
 
