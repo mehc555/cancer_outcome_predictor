@@ -56,7 +56,8 @@ get_common_clinical_features <- function(cancer_types, base_dir = "data/GDC_TCGA
 main <- function() {
     # Define cancer types
     cancer_types <- c("BRCA", "COAD", "LUAD")
-    
+    #cancer_types <- c("BRCA")
+
     # Download TCGA data if needed
     # download_tcga_data() 
 
@@ -84,7 +85,7 @@ main <- function() {
 
 	# Process mutation data
 	message("\nProcessing mutation data...")
-	processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, min_freq = 0.05)
+	processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, min_freq = 0.01)
     
     }
     

@@ -10,9 +10,13 @@ fetch_hotspots <- function(cache_dir = "data/cache") {
   cache_file <- file.path(cache_dir, "cancer_hotspots.rds")
   
   # Check if cached data exists and is less than 1 month old
-  if (file.exists(cache_file) &&
-      difftime(Sys.time(), file.mtime(cache_file), units = "days") < 30) {
-    return(readRDS(cache_file))
+  #if (file.exists(cache_file) &&
+  #    difftime(Sys.time(), file.mtime(cache_file), units = "days") < 30) {
+  #  return(readRDS(cache_file))
+  #}
+
+  if (file.exists(cache_file)) {
+	return(readRDS(cache_file))
   }
   
   # Create cache directory if it doesn't exist
@@ -68,14 +72,6 @@ fetch_hotspots <- function(cache_dir = "data/cache") {
                  nrow(hotspots),
                  length(unique(hotspots$hugoSymbol))))
   
-  # Print top hotspots for verification
-  message("\nTop 5 hotspot mutations by tumor count:")
-  hotspots %>%
-    arrange(desc(tumorCount)) %>%
-    select(hotspot_id, tumorCount, tumorTypeCount) %>%
-    head(5) %>%
-    print()
-  
   return(hotspots)
 }
 
@@ -130,14 +126,9 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
   effect_matrix <- encode_effect_mutations(mutations, samples, frequent_genes)
   vaf_matrix <- encode_vaf_mutations(mutations, samples, frequent_genes)
   integrated_matrix <- encode_integrated_mutations(mutations, samples, frequent_genes)
-  hotspot_matrix <- encode_hotspot_mutations(mutations, samples, frequent_genes, hotspots)
   
-  # Create hybrid encoding
-  hybrid_matrix <- create_hybrid_encoding(
-    integrated_matrix,
-    hotspot_matrix,
-    hotspots
-  )
+  # Create hybrid encoding with hotspots and other mutations
+  hybrid_matrix <- create_hybrid_encoding(mutations, samples, frequent_genes, hotspots)
   
   # Round numerical values to 3 decimal places
   matrices <- list(
@@ -145,7 +136,6 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
     effect = effect_matrix,
     vaf = vaf_matrix,
     integrated = integrated_matrix,
-    hotspot = hotspot_matrix,
     hybrid = hybrid_matrix
   )
   
@@ -157,7 +147,7 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
   lapply(matrices, validate_mutation_data)
   
   # Save all versions
-  file_suffixes <- c("binary", "effect", "vaf", "integrated", "hotspot", "hybrid")
+  file_suffixes <- c("binary", "effect", "vaf", "integrated", "hybrid")
   
   for (suffix in file_suffixes) {
     write_tsv(
@@ -166,6 +156,11 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
     )
   }
   
+  # Calculate summary statistics
+  hotspot_genes <- unique(hotspots$hugoSymbol)
+  n_hotspot_mutations <- sum(grepl("_", colnames(hybrid_matrix)))
+  n_other_mutations <- sum(endsWith(colnames(hybrid_matrix), "_other"))
+  
   # Print processing summary
   message(sprintf("Mutation processing summary for %s:", cancer_type))
   message(sprintf("- Initial number of genes: %d", initial_genes))
@@ -173,15 +168,14 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
                  initial_genes - length(frequent_genes), min_freq * 100))
   message(sprintf("- Retained %d genes", length(frequent_genes)))
   message(sprintf("- Number of samples: %d", n_samples))
-  message(sprintf("- Number of hotspot mutations: %d", 
-                 ncol(hotspot_matrix) - 1))  # -1 for sample column
+  message(sprintf("- Number of hotspot mutations: %d", n_hotspot_mutations))
+  message(sprintf("- Number of genes with other mutation features: %d", n_other_mutations))
   message("- Encodings generated:")
   message("  1. Binary (mutation presence/absence)")
   message("  2. Effect-based (functional impact weights)")
   message("  3. VAF-based (variant allele frequencies)")
   message("  4. Integrated (effect * VAF)")
-  message("  5. Hotspot (position-specific mutations)")
-  message("  6. Hybrid (integrated + hotspot features)")
+  message("  5. Hybrid (hotspot-specific + other mutations)")
   
   return(matrices)
 }
@@ -279,54 +273,102 @@ encode_integrated_mutations <- function(mutations, samples, genes) {
     bind_cols(sample = samples, .)
 }
 
-#' Encode hotspot mutations specifically
+#' Create hybrid encoding combining hotspots and other mutations with integrated encoding
 #' @keywords internal
-encode_hotspot_mutations <- function(mutations, samples, genes, hotspots) {
-  # Create matrix for hotspot mutations
-  hotspot_features <- unique(hotspots$hotspot_id)
+
+create_hybrid_encoding <- function(mutations, samples, genes, hotspots) {
+  # Get genes with hotspots and create lookup table for efficiency
+  hotspot_genes <- unique(hotspots$hugoSymbol)
+  hotspot_lookup <- unique(hotspots$hotspot_id)
+  names(hotspot_lookup) <- hotspot_lookup
+  
+  # Define effect categories and their weights (copied from encode_effect_mutations)
+  effect_weights <- c(
+    "frameshift" = 4,
+    "nonsense" = 4,
+    "splice" = 3,
+    "missense" = 2,
+    "synonymous" = 1,
+    "other" = 1
+  )
+  
+  # Initialize matrix for all features
+  features <- c(
+    # Hotspot-specific features
+    hotspots$hotspot_id,
+    # Other mutation features for genes with hotspots
+    paste0(hotspot_genes, "_other"),
+    # Regular features for genes without hotspots
+    setdiff(genes, hotspot_genes)
+  )
+  
   mutation_matrix <- matrix(0, nrow = length(samples), 
-                          ncol = length(hotspot_features),
-                          dimnames = list(samples, hotspot_features))
+                          ncol = length(features),
+                          dimnames = list(samples, features))
   
   # Process each mutation
   for (i in seq_len(nrow(mutations))) {
     if (mutations$gene[i] %in% genes) {
-      # Create potential hotspot ID
-      hotspot_id <- paste(
-        mutations$gene[i],
-        sub("p\\.[A-Z]*(\\d+).*", "\\1", mutations$Amino_Acid_Change[i]),
-        sub("p\\.[A-Z]*\\d+([A-Z]*)", "\\1", mutations$Amino_Acid_Change[i]),
-        sep = "_"
+      gene <- mutations$gene[i]
+      
+      # Calculate effect weight for integrated encoding
+      effect <- mutations$effect[i]
+      weight <- case_when(
+        grepl("frameshift", effect) ~ effect_weights["frameshift"],
+        grepl("stop_gained|nonsense", effect) ~ effect_weights["nonsense"],
+        grepl("splice", effect) ~ effect_weights["splice"],
+        grepl("missense", effect) ~ effect_weights["missense"],
+        grepl("synonymous", effect) ~ effect_weights["synonymous"],
+        TRUE ~ effect_weights["other"]
       )
       
-      # If this is a known hotspot, record its VAF
-      if (hotspot_id %in% hotspot_features) {
-        mutation_matrix[mutations$sample[i], hotspot_id] <- mutations$dna_vaf[i]
+      # Calculate integrated value (effect * VAF)
+      integrated_value <- weight * mutations$dna_vaf[i]
+      
+      if (gene %in% hotspot_genes) {
+        # Extract residue from amino acid change using the specified regex
+        aa_change <- mutations$Amino_Acid_Change[i]
+        residue <- sub("p\\.([A-Z]\\d+).*", "\\1", aa_change)
+        variant <- sub("p\\.[A-Z]*\\d+([A-Za-z0-9_=*])", "\\1", aa_change)
+        
+        # Create potential hotspot ID
+        hotspot_id <- paste(gene, residue, variant, sep = "_")
+        
+        # Efficient lookup using named vector
+        if (hotspot_id %in% names(hotspot_lookup)) {
+          # For hotspot mutations, we directly set the value
+          # (each specific hotspot mutation is treated independently)
+          mutation_matrix[mutations$sample[i], hotspot_id] <- integrated_value
+        } else {
+          # For other mutations in hotspot genes, we take the maximum
+          # (accumulate the strongest effect of any non-hotspot mutation)
+          other_feature <- paste0(gene, "_other")
+          mutation_matrix[mutations$sample[i], other_feature] <- 
+            max(mutation_matrix[mutations$sample[i], other_feature],
+                integrated_value)
+        }
+      } else {
+        # For regular gene-level mutations, we take the maximum
+        # (accumulate the strongest effect of any mutation in this gene)
+        mutation_matrix[mutations$sample[i], gene] <- 
+          max(mutation_matrix[mutations$sample[i], gene],
+              integrated_value)
       }
+
     }
   }
   
-  as_tibble(mutation_matrix, rownames = "sample")
-}
-
-#' Create hybrid encoding combining gene-level and hotspot features
-#' @keywords internal
-create_hybrid_encoding <- function(integrated_matrix, hotspot_matrix, hotspots) {
-  # Get genes with hotspots
-  hotspot_genes <- unique(hotspots$hugoSymbol)
+  # Add validation output
+  total_hotspots <- sum(mutation_matrix[, hotspots$hotspot_id] > 0)
+  total_other <- sum(mutation_matrix[, paste0(hotspot_genes, "_other")] > 0)
+  total_regular <- sum(mutation_matrix[, setdiff(genes, hotspot_genes)] > 0)
   
-  # Remove gene-level features for genes with hotspots
-  gene_features <- integrated_matrix %>%
-    select(-sample, -any_of(hotspot_genes))
+  message(sprintf("Hybrid encoding summary:"))
+  message(sprintf("- Hotspot mutations: %d", total_hotspots))
+  message(sprintf("- Other mutations in hotspot genes: %d", total_other))
+  message(sprintf("- Regular gene mutations: %d", total_regular))
   
-  # Combine with hotspot features
-  hybrid_matrix <- bind_cols(
-    sample = integrated_matrix$sample,
-    gene_features,
-    select(hotspot_matrix, -sample)
-  )
-  
-  return(hybrid_matrix)
+  return(as_tibble(mutation_matrix, rownames = "sample"))
 }
 
 #' Validate mutation data structure and content
@@ -360,3 +402,4 @@ validate_mutation_data <- function(mutation_data) {
   
   invisible(TRUE)
 }
+
