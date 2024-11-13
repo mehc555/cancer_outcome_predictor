@@ -102,10 +102,8 @@ process_cnv_data <- function(cancer_type, base_dir = "data/GDC_TCGA",
   }
   
   # Return both formats in a list
-  return(list(
-    standard_format = cnv_data,
-    dnn_format = cnv_processed
-  ))
+  return(cnv_processed
+  )
 }
 
 #' Preprocess raw CNV data (keep original values)

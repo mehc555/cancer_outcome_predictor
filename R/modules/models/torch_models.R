@@ -1,4 +1,7 @@
 # R/modules/models/torch_models.R
+
+library(torch)
+
 create_multimodal_model <- function(config) {
   torch::nn_module(
     initialize = function(config) {

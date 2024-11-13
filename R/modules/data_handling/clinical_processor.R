@@ -319,11 +319,5 @@ process_clinical_data <- function(cancer_type,
   }
 
   # Return results
-  return(list(
-    data_dnn = clinical_processed_dnn,
-    data_formatted = clinical_formatted,
-    recipe = recipe_trained,
-    missing_summary = missing_summary,
-    features_used = features_added
-  ))
+  return(data.frame(clinical_processed_dnn))
 }

@@ -74,51 +74,6 @@ validate_sample_consistency <- function(data_files, cancer_type) {
         message(sprintf("%s samples: %d", data_type, length(sample_lists[[data_type]])))
     }
     
-    # Filter all data frames to include only common samples
-    filtered_data <- list()
-    
-    if (!is.null(data_list$mirna)) {
-        filtered_data$mirna <- data_list$mirna %>%
-            filter(sample_id %in% common_samples)
-    }
-    
-    if (!is.null(data_list$methylation)) {
-        filtered_data$methylation <- data_list$methylation %>%
-            filter(sample %in% common_samples)
-    }
-    
-    if (!is.null(data_list$mutations)) {
-        filtered_data$mutations <- data_list$mutations %>%
-            filter(sample %in% common_samples)
-    }
-    
-    if (!is.null(data_list$expression)) {
-        filtered_data$expression <- data_list$expression %>%
-            filter(sample_id %in% common_samples)
-    }
-    
-    if (!is.null(data_list$clinical)) {
-        filtered_data$clinical <- data_list$clinical %>%
-            filter(sample_id %in% common_samples)
-    }
-    
-    if (!is.null(data_list$cnv)) {
-        filtered_data$cnv <- data_list$cnv %>%
-            filter(Sample_ID %in% common_samples)
-    }
-    
-    # Verify all filtered datasets have the same number of samples
-    sample_counts <- sapply(filtered_data, function(df) {
-            return(nrow(df))
-    })
-    
-    if (length(unique(sample_counts)) != 1) {
-        stop(sprintf("Inconsistent sample counts after filtering in %s: %s", 
-                    cancer_type, 
-                    paste(names(sample_counts), sample_counts, sep="=", collapse=", ")))
-    }
-    
-    return(filtered_data)
 }
 
 #' Convert processed data to torch datasets with uniform handling
@@ -175,7 +130,7 @@ main <- function(download=FALSE) {
     }
     
     # Download data
-    if(!dowload) {
+    if(!download) {
     	download_tcga_data()
     }
     # Define cancer types
@@ -203,7 +158,7 @@ main <- function(download=FALSE) {
         processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, 
                                                                           min_tpm = 1, 
                                                                           min_samples = 3)
-        
+    
         # Process mutation data
         message("\nProcessing mutation data...")
         processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, 
@@ -227,7 +182,7 @@ main <- function(download=FALSE) {
         
         # Validate sample consistency and get filtered data
         message("\nValidating sample consistency across data modalities...")
-        processed_data[[cancer_type]] <- validate_sample_consistency(data_files, cancer_type)
+        validate_sample_consistency(data_files, cancer_type)
         
         # Convert to torch datasets
         message("\nConverting data to torch format...")

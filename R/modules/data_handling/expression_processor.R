@@ -151,10 +151,7 @@ process_expression_data <- function(cancer_type, min_tpm = 1, min_samples = 3,
   message(sprintf("  * Standardized: %s", output_file_standardized))
   
   # Return both versions in a list
-  return(list(
-    log2_transformed = expression_final,
-    standardized = standardized_final
-  ))
+  return(standardized_final)
 }
 
 #' Validate expression data structure and content

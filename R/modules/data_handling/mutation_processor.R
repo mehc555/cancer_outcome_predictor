@@ -133,14 +133,14 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
   hybrid_matrix <- create_hybrid_encoding(mutations, samples, frequent_genes, hotspots)
   
   # Round numerical values to 3 decimal places
-  matrices <- list(
+   matrices <- list(
     binary = binary_matrix,
     effect = effect_matrix,
     vaf = vaf_matrix,
     integrated = integrated_matrix,
     hybrid = hybrid_matrix
   )
-  
+
   matrices <- lapply(matrices, function(mat) {
     mat %>% mutate(across(-sample, ~round(., 3)))
   })
@@ -159,7 +159,7 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
   }
   
   # Calculate summary statistics
-  hotspot_genes <- unique(hotspots$hugoSymbol)
+ hotspot_genes <- unique(hotspots$hugoSymbol)
   n_hotspot_mutations <- sum(grepl("_", colnames(hybrid_matrix)))
   n_other_mutations <- sum(endsWith(colnames(hybrid_matrix), "_other"))
   
@@ -179,7 +179,7 @@ process_mutation_data <- function(cancer_type, min_freq = 0.01,
   message("  4. Integrated (effect * VAF)")
   message("  5. Hybrid (hotspot-specific + other mutations)")
   
-  return(matrices)
+  return(data.frame(matrices[["hybrid"]]))
 }
 
 #' Encode mutations using binary representation
