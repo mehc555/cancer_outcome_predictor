@@ -1,5 +1,11 @@
 # R/main.R
 
+# Source base setup
+source("R/setup.R")
+source("R/modules/models/torch_models.R")
+source("R/modules/training/cv_engine.R")
+#source("R/modules/training/train_utils.R")
+
 # Source required modules
 source("R/modules/data_handling/download_processor.R")
 source("R/modules/data_handling/cnv_processor.R")
@@ -9,51 +15,6 @@ source("R/modules/data_handling/mutation_processor.R")
 source("R/modules/data_handling/methylation_processor.R")
 source("R/modules/data_handling/mirna_processor.R")
 set.seed(123)
-
-#' Get common columns across all cancer types, excluding all-NA columns
-#' @param cancer_types Vector of cancer types
-#' @param base_dir Base directory containing the data
-#' @return Vector of column names common to all cancer types with valid data
-get_common_clinical_features <- function(cancer_types, base_dir = "data/GDC_TCGA") {
-    # Read all clinical data files
-    clinical_data_list <- lapply(cancer_types, function(cancer_type) {
-        file_path <- file.path(base_dir, cancer_type, "clinical.tsv")
-        if (!file.exists(file_path)) {
-            stop(sprintf("Clinical data file not found for cancer type %s", cancer_type))
-        }
-        read_tsv(file_path, show_col_types = FALSE)
-    })
-    
-    # Get column names for each cancer type
-    column_lists <- lapply(clinical_data_list, colnames)
-    
-    # Find common columns
-    common_columns <- Reduce(intersect, column_lists)
-    
-    # Check each common column for all-NA across all cancer types
-    valid_columns <- common_columns[sapply(common_columns, function(col) {
-        # Check if the column has any non-NA values in any cancer type
-        any_valid <- sapply(clinical_data_list, function(data) {
-            # Handle both NA and "not reported" as missing values
-            values <- data[[col]]
-            values[values %in% c("not reported", "Not Reported")] <- NA
-            !all(is.na(values))
-        })
-        
-        # Return TRUE if at least one cancer type has non-NA values
-        any(any_valid)
-    })]
-    
-    # Print removed columns for debugging
-    removed_columns <- setdiff(common_columns, valid_columns)
-    if (length(removed_columns) > 0) {
-        message("Removed the following all-NA columns: ", 
-                paste(removed_columns, collapse = ", "))
-    }
-    
-    message("Found ", length(valid_columns), " common clinical features with valid data across all cancer types")
-    return(valid_columns)
-}
 
 #' Check sample consistency across data modalities
 #' @param data_files Named list of file paths for each data type
@@ -165,15 +126,48 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     return(filtered_data)
 }
 
+#' Convert processed data to torch datasets
+#' @param processed_data List of processed data frames
+#' @param config Model configuration
+#' @return List of torch datasets
+create_torch_datasets <- function(processed_data, config) {
+    torch_datasets <- list()
+    
+    for (modality in names(processed_data)) {
+        if (!is.null(processed_data[[modality]])) {
+            if (modality == "expression") {
+                # Handle transposed expression data
+                data_tensor <- torch_tensor(
+                    as.matrix(processed_data[[modality]][,-1]), 
+                    dtype = torch_float32()
+                )
+                # Store gene IDs
+                torch_datasets[[paste0(modality, "_features")]] <- 
+                    processed_data[[modality]]$Ensembl_ID
+            } else {
+                # Handle other modalities
+                data_tensor <- torch_tensor(
+                    as.matrix(processed_data[[modality]]), 
+                    dtype = torch_float32()
+                )
+            }
+            torch_datasets[[modality]] <- data_tensor
+        }
+    }
+    
+    return(torch_datasets)
+}
+
 main <- function() {
+    # Initialize project and load config
+    #if (!exists("config")) {
+    #    initialize_project()
+    #    config <- load_config()
+    #}
     
     # Define cancer types
-    cancer_types <- c("BRCA")
+    cancer_types <- c("BRCA", "COAD", "LUAD")
     base_dir <- "data/GDC_TCGA"
-    
-    # Get common clinical features
-    message("\nIdentifying common clinical features...")
-    common_clinical_features <- get_common_clinical_features(cancer_types)
     
     # Process data for each cancer type
     processed_data <- list()
@@ -183,31 +177,30 @@ main <- function() {
         
         # Process CNV data
         message("\nProcessing CNV data...")
-        #processed_data[[cancer_type]]$cnv <- process_cnv_data(cancer_type, preprocessing_method = "raw")
+        processed_data[[cancer_type]]$cnv <- process_cnv_data(cancer_type, preprocessing_method = "raw")
         
         # Process clinical data with common features
         message("\nProcessing clinical data...")
-        #processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type, 
-        #                                                              common_features = common_clinical_features, 
-        #                                                             impute = FALSE, 
-        #                                                              impute_method = "missing_category")
+        processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type,  
+                                                                      impute = FALSE, 
+                                                                      impute_method = "missing_category")
         
         # Process expression data
         message("\nProcessing gene expression data...")
-        #processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, 
-        #                                                                  min_tpm = 1, 
-        #                                                                  min_samples = 3)
+        processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, 
+                                                                          min_tpm = 1, 
+                                                                          min_samples = 3)
         
         # Process mutation data
         message("\nProcessing mutation data...")
-        #processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, 
-        #                                                               min_freq = 0.01)
+        processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, 
+                                                                       min_freq = 0.01)
         
         message("\nProcessing methylation data...")
-        #processed_data[[cancer_type]]$methylation <- process_methylation_data(cancer_type)
+        processed_data[[cancer_type]]$methylation <- process_methylation_data(cancer_type)
         
         message("\nProcessing mirna expression data...")
-        #processed_data[[cancer_type]]$mirna <- process_mirna_data(cancer_type)
+        processed_data[[cancer_type]]$mirna <- process_mirna_data(cancer_type)
         
         # Define file paths for processed data
         data_files <- list(
@@ -222,10 +215,39 @@ main <- function() {
         # Validate sample consistency and get filtered data
         message("\nValidating sample consistency across data modalities...")
         processed_data[[cancer_type]] <- validate_sample_consistency(data_files, cancer_type)
+        
+        # Convert to torch datasets
+        message("\nConverting data to torch format...")
+        torch_datasets <- create_torch_datasets(
+            processed_data[[cancer_type]], 
+            config$model
+        )
+        
+        # Run nested cross-validation with repeated validation sets
+        message("\nStarting nested cross-validation...")
+        cv_results <- run_nested_cv(
+            datasets = torch_datasets,
+            config = config,
+            cancer_type = cancer_type
+        )
+        
+        # Save results
+        results_dir <- file.path(config$main$paths$results_dir, cancer_type)
+        dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+        
+        saveRDS(
+            cv_results,
+            file.path(results_dir, "cv_results.rds")
+        )
+        
+        # Log completion
+        logger::log_info("Completed processing for cancer type: {cancer_type}")
     }
     
     return(processed_data)
 }
 
 # Run the main function
-main()
+if (!interactive()) {
+    main()
+}
