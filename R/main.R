@@ -14,153 +14,9 @@ source("R/modules/data_handling/expression_processor.R")
 source("R/modules/data_handling/mutation_processor.R")
 source("R/modules/data_handling/methylation_processor.R")
 source("R/modules/data_handling/mirna_processor.R")
+source("R/modules/helper_functions/misc.R")
 set.seed(123)
 
-#' Check sample consistency across data modalities
-#' @param data_files Named list of file paths for each data type
-#' @param cancer_type Current cancer type being processed
-#' @return List of data frames with consistent samples
-validate_sample_consistency <- function(data_files, cancer_type) {
-    # Read all data files
-    data_list <- list()
-    
-    # Read each data type and extract sample IDs
-    if (file.exists(data_files$mirna)) {
-        data_list$mirna <- read_tsv(data_files$mirna, show_col_types = FALSE)
-        data_list$mirna_samples <- data_list$mirna$sample_id
-    }
-    
-    if (file.exists(data_files$methylation)) {
-        data_list$methylation <- read_tsv(data_files$methylation, show_col_types = FALSE)
-        data_list$methylation_samples <- data_list$methylation$sample
-    }
-    
-    if (file.exists(data_files$mutations)) {
-        data_list$mutations <- read_tsv(data_files$mutations, show_col_types = FALSE)
-        data_list$mutations_samples <- data_list$mutations$sample
-    }
-    
-    if (file.exists(data_files$expression)) {
-        data_list$expression <- read_tsv(data_files$expression, show_col_types = FALSE)
-        data_list$expression_samples <- data_list$expression$sample_id
-    }
-    
-    if (file.exists(data_files$clinical)) {
-        data_list$clinical <- read_tsv(data_files$clinical, show_col_types = FALSE)
-        data_list$clinical_samples <- data_list$clinical$sample_id
-    }
-    
-    if (file.exists(data_files$cnv)) {
-        data_list$cnv <- read_tsv(data_files$cnv, show_col_types = FALSE)
-        data_list$cnv_samples <- data_list$cnv$Sample_ID
-    }
-    
-    # Get all sample ID vectors
-    sample_lists <- list()
-    for (data_type in c("mirna", "methylation", "mutations", "expression", "clinical", "cnv")) {
-        sample_col <- paste0(data_type, "_samples")
-        if (!is.null(data_list[[sample_col]])) {
-            sample_lists[[data_type]] <- data_list[[sample_col]]
-        }
-    }
-    
-    # Find common samples across all available data types
-    common_samples <- Reduce(intersect, sample_lists)
-    
-    # Report statistics
-    message(sprintf("\nSample consistency report for %s:", cancer_type))
-    message(sprintf("Common samples across all modalities: %d", length(common_samples)))
-    for (data_type in names(sample_lists)) {
-        message(sprintf("%s samples: %d", data_type, length(sample_lists[[data_type]])))
-    }
-    
-}
-
-#' Convert processed data to torch datasets with proper missing value handling
-#' @param processed_data List of processed data frames
-#' @param config Model configuration
-#' @return List of torch datasets containing both data and masks
-create_torch_datasets <- function(processed_data, config) {
-    torch_datasets <- list()
-    
-    for (modality in names(processed_data)) {
-        if (!is.null(processed_data[[modality]])) {
-            # Convert data frame to matrix and handle different modalities
-            if (modality == "expression") {
-                # Remove Ensembl_ID column and convert to numeric matrix
-                data_matrix <- as.matrix(processed_data[[modality]][, -1])
-                data_matrix <- matrix(as.numeric(data_matrix), 
-                                    nrow = nrow(data_matrix),
-                                    ncol = ncol(data_matrix))
-                # Store gene IDs
-                torch_datasets[[paste0(modality, "_features")]] <- 
-                    processed_data[[modality]]$Ensembl_ID
-                
-            } else if (modality == "clinical") {
-                # Select only numeric columns and convert to matrix
-                numeric_cols <- sapply(processed_data[[modality]], is.numeric)
-                data_matrix <- as.matrix(processed_data[[modality]][, numeric_cols])
-                
-            } else if (modality == "cnv") {
-                # Remove Sample_ID column if present
-                if ("sample_id" %in% colnames(processed_data[[modality]])) {
-                    data_matrix <- as.matrix(processed_data[[modality]][, -which(colnames(processed_data[[modality]]) == "sample_id")])
-                } else {
-                    data_matrix <- as.matrix(processed_data[[modality]])
-                }
-                data_matrix <- matrix(as.numeric(data_matrix), 
-                                    nrow = nrow(data_matrix),
-                                    ncol = ncol(data_matrix))
-                
-            } else if (modality %in% c("mirna", "methylation", "mutations")) {
-                # Remove sample identifier column if present
-                id_cols <- c("sample_id")
-                cols_to_remove <- which(colnames(processed_data[[modality]]) %in% id_cols)
-                if (length(cols_to_remove) > 0) {
-                    data_matrix <- as.matrix(processed_data[[modality]][, -cols_to_remove])
-                } else {
-                    data_matrix <- as.matrix(processed_data[[modality]])
-                }
-                data_matrix <- matrix(as.numeric(data_matrix), 
-                                    nrow = nrow(data_matrix),
-                                    ncol = ncol(data_matrix))
-            }
-            
-            # Create mask for missing values
-            mask_matrix <- !is.na(data_matrix)
-            storage.mode(mask_matrix) <- "double"
-            
-            # Keep the original NA values in the data matrix
-            storage.mode(data_matrix) <- "double"
-            
-            # Create torch tensors with proper error handling
-            tryCatch({
-                # Create tensor for data (NAs will be propagated)
-                torch_datasets[[modality]] <- torch_tensor(
-                    data_matrix,
-                    dtype = torch_float32()
-                )
-                
-                # Create tensor for mask (1 for valid values, 0 for missing values)
-                torch_datasets[[paste0(modality, "_mask")]] <- torch_tensor(
-                    mask_matrix,
-                    dtype = torch_float32()
-                )
-                
-            }, error = function(e) {
-                stop(sprintf("Error converting %s to torch tensor: %s", 
-                           modality, e$message))
-            })
-            
-            # Add dimension names as attributes if needed
-            if (modality != "expression") {  # Expression already has features stored
-                torch_datasets[[paste0(modality, "_features")]] <- colnames(data_matrix)
-            }
-        }
-    }
-    
-    return(torch_datasets)
-}
 
 main <- function(download=FALSE) {
     # Initialize project and load config
@@ -259,7 +115,10 @@ main <- function(download=FALSE) {
     	model = model,  # Add this line
     	datasets = torch_datasets,
     	config = config,
-    	cancer_type = cancer_type
+    	cancer_type = cancer_type,
+        validation_pct = 0.3,
+	test_pct = 0.3,
+	seed = NULL # using seed defined at the top for now
 	)
 
         # Save results

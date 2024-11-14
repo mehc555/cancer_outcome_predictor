@@ -305,9 +305,17 @@ ModalityEncoder <- nn_module(
 #' @param fusion_dim Dimension of fused representation
 #' @param num_heads Number of attention heads
 #' @param dropout Dropout rate
+
 MultiModalSurvivalModel <- nn_module(
   "MultiModalSurvivalModel",
   initialize = function(modality_dims, encoder_dims, fusion_dim, num_heads = 4, dropout = 0.1) {
+    # Store the initialization parameters for copying
+    self$modality_dims <- modality_dims
+    self$encoder_dims <- encoder_dims
+    self$fusion_dim <- fusion_dim
+    self$num_heads <- num_heads
+    self$dropout <- dropout
+
     # Initialize empty dictionary for encoders
     encoders_dict <- list()
 
@@ -373,7 +381,21 @@ MultiModalSurvivalModel <- nn_module(
       predictions = predictions,
       attention_weights = all_attention_weights
     )
+  },
+
+   create_copy = function() {
+    # Create new model instance with same parameters
+    new_model <- MultiModalSurvivalModel(
+      modality_dims = self$modality_dims,
+      encoder_dims = self$encoder_dims,
+      fusion_dim = self$fusion_dim,
+      num_heads = self$num_heads,
+      dropout = self$dropout
+    )
+    
+    # Copy the state dict
+    new_model$load_state_dict(self$state_dict())
+    
+    return(new_model)
   }
 )
-
-
