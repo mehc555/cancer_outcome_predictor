@@ -118,6 +118,8 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
+	max_workers = 2,      # Limit parallel workers
+        batch_size = 32,
 	seed = NULL # using seed defined at the top for now
 	)
 
