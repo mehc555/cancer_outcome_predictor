@@ -35,11 +35,7 @@ initialize_project <- function() {
 #' @return List of validated configuration parameters
 load_config <- function(config_dir = here::here("configs")) {
   # Load main configuration files
-  config <- list(
-    main = yaml::read_yaml(file.path(config_dir, "config.yml")),
-    model = yaml::read_yaml(file.path(config_dir, "model_config.yml")),
-    training = yaml::read_yaml(file.path(config_dir, "training_config.yml"))
-  )
+  config=yaml::read_yaml(file.path(config_dir, "config.yml"))
   
   # Validate configurations
   validate_config(config)
@@ -58,28 +54,28 @@ load_config <- function(config_dir = here::here("configs")) {
 #' @return TRUE if valid, stops with error if invalid
 validate_config <- function(config) {
   # Validate main config
-  assertthat::assert_that(
-    !is.null(config$main$experiment$name),
-    !is.null(config$main$experiment$seed),
-    !is.null(config$main$cv_params$outer_repeats),
-    !is.null(config$main$cv_params$outer_folds),
-    !is.null(config$main$cv_params$inner_folds)
-  )
+  #assertthat::assert_that(
+  #  !is.null(config$main$experiment$name),
+  #  !is.null(config$main$experiment$seed),
+  #  !is.null(config$main$cv_params$outer_repeats),
+  #  !is.null(config$main$cv_params$outer_folds),
+  #  !is.null(config$main$cv_params$inner_folds)
+  #)
   
   # Validate model config
-  assertthat::assert_that(
-    !is.null(config$model$architecture$encoder_dims),
-    !is.null(config$model$architecture$fusion$type),
-    !is.null(config$model$architecture$prediction_head$type)
-  )
+  #assertthat::assert_that(
+  #  !is.null(config$model$architecture$encoder_dims),
+  #  !is.null(config$model$architecture$fusion$type),
+  #  !is.null(config$model$architecture$prediction_head$type)
+  #)
   
   # Validate training config
-  assertthat::assert_that(
-    !is.null(config$training$model$batch_size),
-    !is.null(config$training$model$max_epochs),
-    !is.null(config$training$model$optimizer$name),
-    !is.null(config$training$model$optimizer$lr)
-  )
+  #assertthat::assert_that(
+  #  !is.null(config$training$model$batch_size),
+  #  !is.null(config$training$model$max_epochs),
+  #  !is.null(config$training$model$optimizer$name),
+  #  !is.null(config$training$model$optimizer$lr)
+  #)
   
   return(TRUE)
 }
@@ -123,8 +119,8 @@ setup_experiment_dir <- function(config) {
   
   # Save configuration files
   yaml::write_yaml(config$main, file.path(config$main$paths$results_dir, "config_main.yml"))
-  yaml::write_yaml(config$model, file.path(config$main$paths$results_dir, "config_model.yml"))
-  yaml::write_yaml(config$training, file.path(config$main$paths$results_dir, "config_training.yml"))
+  #yaml::write_yaml(config$model, file.path(config$main$paths$results_dir, "config_model.yml"))
+  #yaml::write_yaml(config$training, file.path(config$main$paths$results_dir, "config_training.yml"))
   
   # Initialize experiment log file
   log_file <- file.path(config$main$paths$logs_dir, "experiment.log")

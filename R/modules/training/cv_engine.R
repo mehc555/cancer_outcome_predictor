@@ -4,6 +4,117 @@ library(future)
 library(future.apply)
 library(progressr)
 
+#' Extract stratification variable from datasets
+#' @param datasets List of torch datasets
+#' @return Vector for stratification
+get_stratification_vector <- function(datasets) {
+  if (!is.null(datasets$clinical)) {
+    # Extract the event information from clinical data
+    clinical_data <- as.matrix(datasets$clinical)
+    # Assuming the event column is present
+    event_col <- which(colnames(datasets$clinical_features) == "demographics_vital_status_alive")
+    if (length(event_col) > 0) {
+      return(clinical_data[, event_col])
+    }
+  }
+  return(NULL)
+}
+
+#' Train model with multi-modal data
+#' @param model Neural network model
+#' @param train_data Training data
+#' @param val_data Validation data
+#' @param config Training configuration
+#' @return Trained model and training history
+train_model <- function(model, train_data, val_data, config) {
+  
+
+  # Create data loaders
+  train_loader <- dataloader(
+   dataset = train_data,
+    batch_size = config$model$batch_size,
+    shuffle = TRUE
+  )
+
+  val_loader <- dataloader(
+    dataset = val_data,
+    batch_size = config$model$batch_size,
+    shuffle = FALSE
+  )
+
+  # Initialize optimizer
+  optimizer <- optim_adam(
+    model$parameters,
+    lr = config$model$optimizer$lr,
+    weight_decay = config$model$optimizer$weight_decay
+  )
+
+  # Initialize scheduler
+  scheduler <- lr_reduce_on_plateau(
+    optimizer,
+    patience = config$model$scheduler$patience,
+    factor = config$model$scheduler$factor
+  )
+
+  # Training loop
+  best_val_loss <- Inf
+  patience_counter <- 0
+
+  for (epoch in 1:config$model$max_epochs) {
+    # Training phase
+    model$train()
+    train_losses <- c()
+
+    coro::loop(for (batch in train_loader) {
+      optimizer$zero_grad()
+
+      # Forward pass
+      output <- model(batch$data, batch$masks)
+      loss <- compute_loss(output$predictions, batch$target)
+
+      # Backward pass
+      loss$backward()
+      optimizer$step()
+
+      train_losses <- c(train_losses, loss$item())
+    })
+
+    # Validation phase
+    model$eval()
+    val_losses <- c()
+
+    with_no_grad({
+      coro::loop(for (batch in val_loader) {
+        output <- model(batch$data, batch$masks)
+        loss <- compute_loss(output$predictions, batch$target)
+        val_losses <- c(val_losses, loss$item())
+      })
+    })
+
+    # Calculate average losses
+    avg_train_loss <- mean(train_losses)
+    avg_val_loss <- mean(val_losses)
+
+    # Update scheduler
+    scheduler$step(avg_val_loss)
+
+    # Early stopping check
+    if (avg_val_loss < best_val_loss - config$model$early_stopping$min_delta) {
+      best_val_loss <- avg_val_loss
+      patience_counter <- 0
+    } else {
+      patience_counter <- patience_counter + 1
+    }
+
+    if (patience_counter >= config$model$early_stopping$patience) {
+      break
+    }
+  }
+
+  return(model)
+}
+
+
 #' Create data splits for nested cross-validation
 #' @param n_samples Total number of samples
 #' @param n_repeats Number of repetitions for validation sets
@@ -74,11 +185,16 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
 #' @param config Configuration parameters
 #' @param cancer_type Current cancer type
 #' @return List of results and models
-run_nested_cv <- function(datasets, config, cancer_type) {
+run_nested_cv <- function(model, datasets, config, cancer_type) {
+
+
+    # Extract stratification vector
+    stratify <- get_stratification_vector(datasets)
+
     # Extract parameters from config
-    n_repeats <- config$main$cv_params$outer_repeats
-    n_outer_folds <- config$main$cv_params$outer_folds
-    n_inner_folds <- config$main$cv_params$inner_folds
+    n_repeats <- config$cv_params$outer_repeats
+    n_outer_folds <- config$cv_params$outer_folds
+    n_inner_folds <- config$cv_params$inner_folds
     
     # Get total number of samples
     n_samples <- nrow(datasets[[1]])

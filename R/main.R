@@ -42,7 +42,7 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     
     if (file.exists(data_files$expression)) {
         data_list$expression <- read_tsv(data_files$expression, show_col_types = FALSE)
-        data_list$expression_samples <- data_list$sample_id
+        data_list$expression_samples <- data_list$expression$sample_id
     }
     
     if (file.exists(data_files$clinical)) {
@@ -76,46 +76,86 @@ validate_sample_consistency <- function(data_files, cancer_type) {
     
 }
 
-#' Convert processed data to torch datasets with uniform handling
+#' Convert processed data to torch datasets with proper missing value handling
 #' @param processed_data List of processed data frames
 #' @param config Model configuration
-#' @return List of torch datasets
+#' @return List of torch datasets containing both data and masks
 create_torch_datasets <- function(processed_data, config) {
     torch_datasets <- list()
     
     for (modality in names(processed_data)) {
         if (!is.null(processed_data[[modality]])) {
-            # Remove identifier columns if present
-            id_cols <- c("sample_id", "sample", "Sample_ID")
-            cols_to_remove <- which(colnames(processed_data[[modality]]) %in% id_cols)
-            
-            if (length(cols_to_remove) > 0) {
-                data_matrix <- as.matrix(processed_data[[modality]][, -cols_to_remove])
-            } else {
-                data_matrix <- as.matrix(processed_data[[modality]])
+            # Convert data frame to matrix and handle different modalities
+            if (modality == "expression") {
+                # Remove Ensembl_ID column and convert to numeric matrix
+                data_matrix <- as.matrix(processed_data[[modality]][, -1])
+                data_matrix <- matrix(as.numeric(data_matrix), 
+                                    nrow = nrow(data_matrix),
+                                    ncol = ncol(data_matrix))
+                # Store gene IDs
+                torch_datasets[[paste0(modality, "_features")]] <- 
+                    processed_data[[modality]]$Ensembl_ID
+                
+            } else if (modality == "clinical") {
+                # Select only numeric columns and convert to matrix
+                numeric_cols <- sapply(processed_data[[modality]], is.numeric)
+                data_matrix <- as.matrix(processed_data[[modality]][, numeric_cols])
+                
+            } else if (modality == "cnv") {
+                # Remove Sample_ID column if present
+                if ("sample_id" %in% colnames(processed_data[[modality]])) {
+                    data_matrix <- as.matrix(processed_data[[modality]][, -which(colnames(processed_data[[modality]]) == "sample_id")])
+                } else {
+                    data_matrix <- as.matrix(processed_data[[modality]])
+                }
+                data_matrix <- matrix(as.numeric(data_matrix), 
+                                    nrow = nrow(data_matrix),
+                                    ncol = ncol(data_matrix))
+                
+            } else if (modality %in% c("mirna", "methylation", "mutations")) {
+                # Remove sample identifier column if present
+                id_cols <- c("sample_id")
+                cols_to_remove <- which(colnames(processed_data[[modality]]) %in% id_cols)
+                if (length(cols_to_remove) > 0) {
+                    data_matrix <- as.matrix(processed_data[[modality]][, -cols_to_remove])
+                } else {
+                    data_matrix <- as.matrix(processed_data[[modality]])
+                }
+                data_matrix <- matrix(as.numeric(data_matrix), 
+                                    nrow = nrow(data_matrix),
+                                    ncol = ncol(data_matrix))
             }
             
-            # Convert to numeric matrix and handle NAs
-            data_matrix <- matrix(as.numeric(data_matrix), 
-                                nrow = nrow(data_matrix),
-                                ncol = ncol(data_matrix))
-            data_matrix[is.na(data_matrix)] <- 0
+            # Create mask for missing values
+            mask_matrix <- !is.na(data_matrix)
+            storage.mode(mask_matrix) <- "double"
+            
+            # Keep the original NA values in the data matrix
             storage.mode(data_matrix) <- "double"
             
-            # Create torch tensor with error handling
+            # Create torch tensors with proper error handling
             tryCatch({
+                # Create tensor for data (NAs will be propagated)
                 torch_datasets[[modality]] <- torch_tensor(
                     data_matrix,
                     dtype = torch_float32()
                 )
                 
-                # Store feature names
-                torch_datasets[[paste0(modality, "_features")]] <- colnames(data_matrix)
+                # Create tensor for mask (1 for valid values, 0 for missing values)
+                torch_datasets[[paste0(modality, "_mask")]] <- torch_tensor(
+                    mask_matrix,
+                    dtype = torch_float32()
+                )
                 
             }, error = function(e) {
                 stop(sprintf("Error converting %s to torch tensor: %s", 
                            modality, e$message))
             })
+            
+            # Add dimension names as attributes if needed
+            if (modality != "expression") {  # Expression already has features stored
+                torch_datasets[[paste0(modality, "_features")]] <- colnames(data_matrix)
+            }
         }
     }
     
@@ -152,13 +192,11 @@ main <- function(download=FALSE) {
         processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type,  
                                                                       impute = FALSE, 
                                                                       impute_method = "missing_category")
-        
         # Process expression data
         message("\nProcessing gene expression data...")
         processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, 
                                                                           min_tpm = 1, 
                                                                           min_samples = 3)
-    
         # Process mutation data
         message("\nProcessing mutation data...")
         processed_data[[cancer_type]]$mutations <- process_mutation_data(cancer_type, 
@@ -171,6 +209,7 @@ main <- function(download=FALSE) {
         processed_data[[cancer_type]]$mirna <- process_mirna_data(cancer_type)
         
         # Define file paths for processed data
+	# Change this later on to use the processed_data list instead
         data_files <- list(
             mirna = file.path(base_dir, cancer_type, "processed", "mirna_processed.tsv"),
             methylation = file.path(base_dir, cancer_type, "processed", "methylation_processed.tsv"),
@@ -184,21 +223,45 @@ main <- function(download=FALSE) {
         message("\nValidating sample consistency across data modalities...")
         validate_sample_consistency(data_files, cancer_type)
         
-        # Convert to torch datasets
+	# Write all input data to disk before training and harmonize sample_id column name
+	
+	input_dir <- file.path(base_dir, cancer_type, "input_data")
+  	if (!dir.exists(input_dir)) {
+    		dir.create(input_dir, recursive = TRUE)
+  	}
+
+        for (modality in names(processed_data[[cancer_type]])) {
+		colnames(processed_data[[cancer_type]][[modality]])[1]="sample_id"
+		print(paste0("Modality: ", modality))
+		print(head(processed_data[[cancer_type]][[modality]][,1:4]))
+		write.table(processed_data[[cancer_type]][[modality]], paste0(input_dir,"/",modality,".matrix.tsv"), quote=F, row.names=F, sep="\t")
+	}
+
+	# Convert to torch datasets
         message("\nConverting data to torch format...")
         torch_datasets <- create_torch_datasets(
             processed_data[[cancer_type]], 
             config$model
         )
-        
-        # Run nested cross-validation with repeated validation sets
-        message("\nStarting nested cross-validation...")
-        cv_results <- run_nested_cv(
-            datasets = torch_datasets,
-            config = config,
-            cancer_type = cancer_type
-        )
-        
+
+	# Initialize model
+	model <- MultiModalSurvivalModel(
+    	modality_dims = config$model$architecture$modality_dims,
+    	encoder_dims = config$model$architecture$encoder_dims,
+    	fusion_dim = config$model$architecture$fusion_dim,
+    	num_heads = config$model$architecture$num_heads,
+    	dropout = config$model$architecture$dropout
+	)
+
+	# Run nested cross-validation with repeated validation sets
+	message("\nStarting nested cross-validation...")
+	cv_results <- run_nested_cv(
+    	model = model,  # Add this line
+    	datasets = torch_datasets,
+    	config = config,
+    	cancer_type = cancer_type
+	)
+
         # Save results
         results_dir <- file.path(config$main$paths$results_dir, cancer_type)
         dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
