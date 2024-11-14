@@ -3,18 +3,28 @@
 library(future)
 library(future.apply)
 library(progressr)
+library(survival)
+library(glmnet)
 
 #' Extract stratification variable from datasets
 #' @param datasets List of torch datasets
+#' @param outcome_type Either "binary" or "survival"
 #' @return Vector for stratification
-get_stratification_vector <- function(datasets) {
+get_stratification_vector <- function(datasets, outcome_type = "binary") {
   if (!is.null(datasets$clinical)) {
-    # Extract the event information from clinical data
     clinical_data <- as.matrix(datasets$clinical)
-    # Assuming the event column is present
-    event_col <- which(colnames(datasets$clinical_features) == "demographics_vital_status_alive")
-    if (length(event_col) > 0) {
-      return(clinical_data[, event_col])
+    
+    if (outcome_type == "binary") {
+      event_col <- which(colnames(datasets$clinical_features) == "demographics_vital_status_alive")
+      if (length(event_col) > 0) {
+        return(clinical_data[, event_col])
+      }
+    } else if (outcome_type == "survival") {
+      # For survival, stratify by event status
+      event_col <- which(colnames(datasets$clinical_features) == "demographics_vital_status_alive")
+      if (length(event_col) > 0) {
+        return(factor(clinical_data[, event_col]))
+      }
     }
   }
   return(NULL)
@@ -25,13 +35,12 @@ get_stratification_vector <- function(datasets) {
 #' @param train_data Training data
 #' @param val_data Validation data
 #' @param config Training configuration
+#' @param outcome_type Either "binary" or "survival"
 #' @return Trained model and training history
-train_model <- function(model, train_data, val_data, config) {
-  
-
+train_model <- function(model, train_data, val_data, config, outcome_type = "binary") {
   # Create data loaders
   train_loader <- dataloader(
-   dataset = train_data,
+    dataset = train_data,
     batch_size = config$model$batch_size,
     shuffle = TRUE
   )
@@ -56,106 +65,255 @@ train_model <- function(model, train_data, val_data, config) {
     factor = config$model$scheduler$factor
   )
 
-  # Training loop
+  # Initialize tracking variables
   best_val_loss <- Inf
   patience_counter <- 0
+  best_model_state <- model$state_dict()
+  training_history <- list()
 
+  # Training loop
   for (epoch in 1:config$model$max_epochs) {
     # Training phase
     model$train()
     train_losses <- c()
+    train_metrics <- list()
 
     coro::loop(for (batch in train_loader) {
       optimizer$zero_grad()
 
       # Forward pass
       output <- model(batch$data, batch$masks)
-      loss <- compute_loss(output$predictions, batch$target)
+      
+      # Compute loss based on outcome type
+      if (outcome_type == "binary") {
+        loss <- nn_bce_with_logits_loss()(output$predictions, batch$target)
+      } else if (outcome_type == "survival") {
+        # Cox partial likelihood loss
+        loss <- compute_cox_loss(output$predictions, batch$time, batch$event)
+      }
 
-      # Backward pass
+      # Backward pass and optimization
       loss$backward()
       optimizer$step()
 
+      # Record loss
       train_losses <- c(train_losses, loss$item())
+
+      # Calculate additional metrics
+      if (outcome_type == "binary") {
+        batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
+      } else {
+        batch_metrics <- calculate_survival_metrics(output$predictions, batch$time, batch$event)
+      }
+      
+      # Accumulate metrics
+      for (metric_name in names(batch_metrics)) {
+        if (is.null(train_metrics[[metric_name]])) {
+          train_metrics[[metric_name]] <- c()
+        }
+        train_metrics[[metric_name]] <- c(train_metrics[[metric_name]], batch_metrics[[metric_name]])
+      }
     })
 
     # Validation phase
     model$eval()
     val_losses <- c()
+    val_metrics <- list()
 
     with_no_grad({
       coro::loop(for (batch in val_loader) {
         output <- model(batch$data, batch$masks)
-        loss <- compute_loss(output$predictions, batch$target)
+        
+        # Compute validation loss
+        if (outcome_type == "binary") {
+          loss <- nn_bce_with_logits_loss()(output$predictions, batch$target)
+        } else if (outcome_type == "survival") {
+          loss <- compute_cox_loss(output$predictions, batch$time, batch$event)
+        }
+        
         val_losses <- c(val_losses, loss$item())
+
+        # Calculate validation metrics
+        if (outcome_type == "binary") {
+          batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
+        } else {
+          batch_metrics <- calculate_survival_metrics(output$predictions, batch$time, batch$event)
+        }
+        
+        # Accumulate metrics
+        for (metric_name in names(batch_metrics)) {
+          if (is.null(val_metrics[[metric_name]])) {
+            val_metrics[[metric_name]] <- c()
+          }
+          val_metrics[[metric_name]] <- c(val_metrics[[metric_name]], batch_metrics[[metric_name]])
+        }
       })
     })
 
-    # Calculate average losses
-    avg_train_loss <- mean(train_losses)
-    avg_val_loss <- mean(val_losses)
+    # Calculate epoch metrics
+    epoch_metrics <- list(
+      train_loss = mean(train_losses),
+      val_loss = mean(val_losses)
+    )
+    
+    # Add mean of accumulated metrics
+    for (metric_name in names(train_metrics)) {
+      epoch_metrics[[paste0("train_", metric_name)]] <- mean(train_metrics[[metric_name]])
+      epoch_metrics[[paste0("val_", metric_name)]] <- mean(val_metrics[[metric_name]])
+    }
+
+    # Store training history
+    training_history[[epoch]] <- epoch_metrics
 
     # Update scheduler
-    scheduler$step(avg_val_loss)
+    scheduler$step(epoch_metrics$val_loss)
 
     # Early stopping check
-    if (avg_val_loss < best_val_loss - config$model$early_stopping$min_delta) {
-      best_val_loss <- avg_val_loss
+    if (epoch_metrics$val_loss < best_val_loss - config$model$early_stopping$min_delta) {
+      best_val_loss <- epoch_metrics$val_loss
+      best_model_state <- model$state_dict()
       patience_counter <- 0
     } else {
       patience_counter <- patience_counter + 1
     }
 
+    # Print progress
+    if (epoch %% config$model$print_every == 0) {
+      message(sprintf("Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f", 
+                     epoch, config$model$max_epochs, 
+                     epoch_metrics$train_loss, epoch_metrics$val_loss))
+    }
+
+    # Early stopping
     if (patience_counter >= config$model$early_stopping$patience) {
+      message(sprintf("Early stopping triggered at epoch %d", epoch))
       break
     }
   }
 
-  return(model)
+  # Load best model state
+  model$load_state_dict(best_model_state)
+
+  return(list(
+    model = model,
+    history = training_history,
+    best_val_loss = best_val_loss
+  ))
 }
 
-
-#' Validate CV split indices
-#' @param split_indices List of indices to validate
-#' @param n_samples Total number of samples
-#' @param name Name of the split for error messages
-validate_indices <- function(split_indices, n_samples, name = "") {
-    # Check if indices are numeric
-    if (!is.numeric(split_indices)) {
-        stop(sprintf("Invalid %s indices: must be numeric", name))
+#' Compute Cox partial likelihood loss
+#' @param predictions Model predictions
+#' @param times Survival times
+#' @param events Event indicators
+#' @return Cox loss
+compute_cox_loss <- function(predictions, times, events) {
+  # Convert to CPU for calculations
+  pred <- predictions$cpu()
+  times <- times$cpu()
+  events <- events$cpu()
+  
+  # Sort by time in descending order
+  sorted_indices <- order(times, decreasing = TRUE)
+  pred <- pred[sorted_indices]
+  times <- times[sorted_indices]
+  events <- events[sorted_indices]
+  
+  # Calculate Cox partial likelihood
+  n_samples <- length(times)
+  log_risk <- torch_zeros(n_samples)
+  
+  for (i in 1:n_samples) {
+    if (events[i] == 1) {
+      # Calculate risk set (patients who haven't experienced event at time i)
+      risk_set <- pred[times >= times[i]]
+      # Compute log partial likelihood
+      log_risk[i] <- pred[i] - torch_log(torch_sum(torch_exp(risk_set)))
     }
-    
-    # Check for NA values
-    if (any(is.na(split_indices))) {
-        stop(sprintf("NA values found in %s indices", name))
-    }
-    
-    # Check for duplicates
-    if (any(duplicated(split_indices))) {
-        stop(sprintf("Duplicate indices found in %s", name))
-    }
-    
-    # Check range
-    if (any(split_indices < 1) || any(split_indices > n_samples)) {
-        stop(sprintf("%s indices out of range [1, %d]", name, n_samples))
-    }
+  }
+  
+  # Return negative log partial likelihood
+  -torch_mean(log_risk)
 }
 
-#' Check for overlap between sets of indices
-#' @param set1 First set of indices
-#' @param set2 Second set of indices
-#' @param set1_name Name of first set for error messages
-#' @param set2_name Name of second set for error messages
-check_overlap <- function(set1, set2, set1_name, set2_name) {
-    overlap <- intersect(set1, set2)
-    if (length(overlap) > 0) {
-        stop(sprintf("Overlap found between %s and %s: %s", 
-                    set1_name, set2_name, 
-                    paste(overlap, collapse=", ")))
-    }
+#' Calculate metrics for binary classification
+#' @param predictions Model predictions
+#' @param targets True labels
+#' @return List of metrics
+calculate_binary_metrics <- function(predictions, targets) {
+  # Convert predictions to probabilities
+  probs <- torch_sigmoid(predictions)
+  preds <- (probs > 0.5)$to(dtype = torch_long())
+  
+  # Convert to CPU for calculations
+  preds <- preds$cpu()
+  targets <- targets$cpu()
+  
+  # Calculate metrics
+  tp <- torch_sum(preds * targets)$item()
+  fp <- torch_sum(preds * (1 - targets))$item()
+  fn <- torch_sum((1 - preds) * targets)$item()
+  tn <- torch_sum((1 - preds) * (1 - targets))$item()
+  
+  # Calculate various metrics
+  accuracy <- (tp + tn) / (tp + fp + fn + tn)
+  precision <- if (tp + fp > 0) tp / (tp + fp) else 0
+  recall <- if (tp + fn > 0) tp / (tp + fn) else 0
+  f1 <- if (precision + recall > 0) 2 * (precision * recall) / (precision + recall) else 0
+  
+  # Calculate AUC-ROC if possible
+  auc <- tryCatch({
+    probs_cpu <- as.numeric(probs$cpu())
+    targets_cpu <- as.numeric(targets$cpu())
+    pROC::auc(pROC::roc(targets_cpu, probs_cpu, quiet = TRUE))
+  }, error = function(e) NA)
+  
+  list(
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1 = f1,
+    auc = auc
+  )
 }
 
-#' Create data splits for nested cross-validation with proper k-fold structure
+#' Calculate metrics for survival prediction
+#' @param predictions Model predictions
+#' @param times Survival times
+#' @param events Event indicators
+#' @return List of metrics
+calculate_survival_metrics <- function(predictions, times, events) {
+  # Convert to CPU for calculations
+  preds <- as.numeric(predictions$cpu())
+  times <- as.numeric(times$cpu())
+  events <- as.numeric(events$cpu())
+  
+  # Calculate C-index
+  c_index <- survival::survConcordance(
+    Surv(times, events) ~ preds
+  )$concordance
+  
+  # Calculate integrated Brier score if possible
+  ibs <- tryCatch({
+    max_time <- max(times)
+    time_points <- seq(0, max_time, length.out = 100)
+    pred_survival <- exp(-exp(preds))
+    
+    brier_scores <- sapply(time_points, function(t) {
+      # Calculate Brier score at time t
+      actual_survival <- events == 0 | times > t
+      mean((actual_survival - pred_survival)^2)
+    })
+    
+    mean(brier_scores)
+  }, error = function(e) NA)
+  
+  list(
+    c_index = c_index,
+    ibs = ibs
+  )
+}
+
+#' Create data splits for nested cross-validation
 #' @param n_samples Total number of samples
 #' @param n_repeats Number of repetitions (R)
 #' @param n_outer_folds Number of outer folds (K)
@@ -166,7 +324,7 @@ check_overlap <- function(set1, set2, set1_name, set2_name) {
 #' @param seed Optional seed for reproducibility
 #' @return List of CV split indices
 create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds, 
-                           validation_pct = 0.1, test_pct = 0.2, stratify = NULL, seed = NULL) {
+                           validation_pct = 0.3, test_pct = 0.3, stratify = NULL, seed = NULL) {
     if (!is.null(seed)) {
         set.seed(seed)
     }
@@ -178,104 +336,113 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
     if (n_inner_folds < 2) stop("n_inner_folds must be at least 2")
     if (validation_pct <= 0 || validation_pct >= 1) stop("validation_pct must be between 0 and 1")
     if (test_pct <= 0 || test_pct >= 1) stop("test_pct must be between 0 and 1")
-    if (validation_pct + test_pct >= 1) stop("Sum of validation_pct and test_pct must be less than 1")
     
-    # Create R repeated splits
     repeated_splits <- lapply(1:n_repeats, function(r) {
-        # Calculate split sizes
-        validation_size <- floor(n_samples * validation_pct)
-        remaining_samples <- n_samples - validation_size
-        
         # First split: Validation vs rest
-        all_indices <- 1:n_samples
+        validation_size <- floor(n_samples * validation_pct)
         validation_indices <- if (!is.null(stratify)) {
-            # Stratified sampling for validation
-            strata <- unique(stratify)
-            val_indices <- c()
-            for (stratum in strata) {
-                stratum_indices <- which(stratify == stratum)
-                stratum_size <- floor(validation_size * length(stratum_indices) / n_samples)
-                val_indices <- c(val_indices, 
-                               sample(stratum_indices, stratum_size))
-            }
-            val_indices
+            create_stratified_split(1:n_samples, stratify, validation_size)
         } else {
-            sample(all_indices, validation_size)
+            sample(1:n_samples, validation_size)
         }
         
         # Get remaining indices
-        remaining_indices <- setdiff(all_indices, validation_indices)
+        remaining_indices <- setdiff(1:n_samples, validation_indices)
+        remaining_samples <- length(remaining_indices)
         
         # Second split: Test vs Train from remaining
         test_size <- floor(remaining_samples * test_pct)
-        test_indices <- sample(remaining_indices, test_size)
+        test_indices <- if (!is.null(stratify)) {
+            create_stratified_split(remaining_indices, stratify[remaining_indices], test_size)
+        } else {
+            sample(remaining_indices, test_size)
+        }
+        
         train_indices <- setdiff(remaining_indices, test_indices)
         
-        # Create K outer folds
-        outer_folds <- lapply(1:n_outer_folds, function(k) {
-            # For each K-fold, use all training data
-            # Create M inner folds
-            inner_folds <- lapply(1:n_inner_folds, function(m) {
-                # For each M-fold:
-                # 1. Use all training indices
-                # 2. Randomly select test_pct for inner testing
-                inner_test_size <- floor(length(train_indices) * test_pct)
-                inner_test <- sample(train_indices, inner_test_size)
-                inner_train <- setdiff(train_indices, inner_test)
-                
-                list(
-                    train_idx = inner_train,
-                    test_idx = inner_test
-                )
-            })
+        # Create outer folds - each uses full training set
+        outer_folds <- create_stratified_folds(
+            train_indices = train_indices,
+            stratify = if (!is.null(stratify)) stratify[train_indices] else NULL,
+            n_folds = n_outer_folds,
+            test_pct = test_pct
+        )
+        
+        # Add inner folds to each outer fold
+        outer_folds <- lapply(seq_along(outer_folds), function(k) {
+            inner_folds <- create_stratified_folds(
+                train_indices = outer_folds[[k]]$train_idx,
+                stratify = if (!is.null(stratify)) stratify[outer_folds[[k]]$train_idx] else NULL,
+                n_folds = n_inner_folds,
+                test_pct = test_pct
+            )
             
-            names(inner_folds) <- paste0("K-Fold-", k, "-M-Fold-", 1:n_inner_folds)
+            names(inner_folds) <- paste0("M-Fold-", 1:n_inner_folds)
             
             list(
                 name = paste0("K-Fold-", k),
-                train_idx = train_indices,  # Use full training set
-                test_idx = test_indices,    # Same test set for all K folds
+                train_idx = outer_folds[[k]]$train_idx,
+                test_idx = test_indices,  # Use same test set for all K-folds
                 inner_folds = inner_folds
             )
         })
         
-        # Add names to outer folds
         names(outer_folds) <- paste0("K-Fold-", 1:n_outer_folds)
         
-        # Print structure for first repeat
+        # Print detailed structure for first repeat
         if (r == 1) {
-            message(sprintf("\nRepeat %d Structure:", r))
+            message("\n=== Initial Split ===")
             message(sprintf("Total samples: %d", n_samples))
             message(sprintf("Validation set: %d samples (%.1f%%)", 
                           validation_size, 100 * validation_size/n_samples))
-            message(sprintf("Test set: %d samples (%.1f%%)", 
+            message(sprintf("Remaining samples: %d", remaining_samples))
+            
+            message("\n=== Second Split of Remaining Data ===")
+            message(sprintf("Test set: %d samples (%.1f%% of remaining)", 
                           test_size, 100 * test_size/remaining_samples))
             message(sprintf("Training set: %d samples", length(train_indices)))
             
-            message("\nFold Structure:")
-            message(sprintf("Outer: %d K-folds", n_outer_folds))
-            for (k in seq_along(outer_folds)) {
-                message(sprintf("  %s:", names(outer_folds)[k]))
-                message(sprintf("    Train: %d samples", length(outer_folds[[k]]$train_idx)))
-                message(sprintf("    Test: %d samples", length(outer_folds[[k]]$test_idx)))
-                message("    Inner M-folds:")
-                for (m in seq_along(outer_folds[[k]]$inner_folds)) {
-                    message(sprintf("      %s: Train=%d, Test=%d samples", 
-                                  names(outer_folds[[k]]$inner_folds)[m],
-                                  length(outer_folds[[k]]$inner_folds[[m]]$train_idx),
-                                  length(outer_folds[[k]]$inner_folds[[m]]$test_idx)))
+            message("\n=== K-fold Structure ===")
+            message(sprintf("Number of K-folds: %d", n_outer_folds))
+            message(sprintf("Full training set (each K-fold): %d samples", 
+                          length(train_indices)))
+            message(sprintf("Fixed test set (all K-folds): %d samples", 
+                          length(test_indices)))
+            
+            message("\n=== M-fold Structure (per K-fold) ===")
+            inner_test_size <- floor(length(train_indices) * test_pct)
+            inner_train_size <- length(train_indices) - inner_test_size
+            message(sprintf("Number of M-folds per K-fold: %d", n_inner_folds))
+            message(sprintf("Inner test size: %d samples (%.1f%% of training)", 
+                          inner_test_size, 100 * test_pct))
+            message(sprintf("Inner train size: %d samples", inner_train_size))
+            
+            if (!is.null(stratify)) {
+                message("\n=== Stratification Balance ===")
+                strata <- unique(stratify)
+                for (split_name in c("Validation", "Test", "Training")) {
+                    indices <- switch(split_name,
+                                   "Validation" = validation_indices,
+                                   "Test" = test_indices,
+                                   "Training" = train_indices)
+                    counts <- table(stratify[indices])
+                    props <- prop.table(counts)
+                    message(sprintf("\n%s set distribution:", split_name))
+                    for (s in names(counts)) {
+                        message(sprintf("  - %s: %.1f%% (%d samples)", 
+                                      s, 100 * props[s], counts[s]))
+                    }
                 }
             }
         }
         
         list(
-            repeat_num = r,
+            iteration = r,
             validation = validation_indices,
             outer_splits = outer_folds
         )
     })
     
-    # Add summary information
     attr(repeated_splits, "summary") <- list(
         n_samples = n_samples,
         n_repeats = n_repeats,
@@ -283,92 +450,124 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         n_inner_folds = n_inner_folds,
         stratified = !is.null(stratify),
         validation_pct = validation_pct,
-        test_pct = test_pct,
-        train_pct = 1 - (validation_pct + test_pct)
+        test_pct = test_pct
     )
     
     return(repeated_splits)
 }
 
-#' Create random k folds with proper test/train structure
-#' @param indices Vector of indices to split
-#' @param k Number of folds
-#' @param test_pct Percentage for test set
-#' @param fold_prefix Prefix for fold labels
-#' @param stratify_vec Optional stratification vector
-create_random_kfold <- function(train_indices, test_indices, k, fold_prefix, stratify_vec = NULL) {
-    # Test indices stay constant
-    # Only split training indices into k folds
-    n_train <- length(train_indices)
-    fold_size <- floor(n_train / k)
 
-    # Create k folds from training data
-    folds <- vector("list", k)
-    names(folds) <- paste0(fold_prefix, "-Fold-", 1:k)
-
-    # Randomly shuffle training indices
-    shuffled_train <- sample(train_indices)
-
-    # Create k approximately equal-sized folds
-    for (i in 1:k) {
-        start_idx <- (i-1) * fold_size + 1
-        if (i == k) {
-            fold_train <- shuffled_train[start_idx:length(shuffled_train)]
-        } else {
-            end_idx <- i * fold_size
-            fold_train <- shuffled_train[start_idx:end_idx]
-        }
-
-        folds[[i]] <- list(
-            train = fold_train,
-            test = test_indices  # Same test set for all folds
-        )
+#' Create stratified split
+#' @param indices Indices to split
+#' @param stratify Stratification vector
+#' @param size Size of split
+#' @return Vector of indices for split
+create_stratified_split <- function(indices, stratify, size) {
+    strata <- unique(stratify)
+    split_indices <- c()
+    
+    for (stratum in strata) {
+        stratum_indices <- indices[stratify[indices] == stratum]
+        stratum_size <- floor(size * length(stratum_indices) / length(indices))
+        split_indices <- c(split_indices, sample(stratum_indices, stratum_size))
     }
+    
+    return(split_indices)
+}
 
+#' Create stratified folds for inner/outer splits
+#' @param train_indices Training indices to split
+#' @param stratify Stratification vector
+#' @param n_folds Number of folds
+#' @param test_pct Percentage for test set
+#' @return List of folds with train and test indices
+create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct = 0.3) {
+    # For each fold, we use the full training set and sample a test set
+    folds <- lapply(1:n_folds, function(i) {
+        # Calculate test size
+        test_size <- floor(length(train_indices) * test_pct)
+        
+        if (!is.null(stratify)) {
+            # Stratified sampling for test set
+            strata <- unique(stratify[train_indices])
+            test_idx <- c()
+            
+            for (stratum in strata) {
+                stratum_indices <- train_indices[stratify[train_indices] == stratum]
+                stratum_size <- floor(test_size * length(stratum_indices) / length(train_indices))
+                test_idx <- c(test_idx, sample(stratum_indices, stratum_size))
+            }
+        } else {
+            # Random sampling for test set
+            test_idx <- sample(train_indices, test_size)
+        }
+        
+        list(
+            train_idx = train_indices,  # Use full training set
+            test_idx = test_idx         # Sampled test set
+        )
+    })
+    
     return(folds)
 }
 
-#' Create inner M folds
-#' @param train_indices Training indices to split
-#' @param test_pct Percentage for test set
-#' @param m Number of folds
-create_inner_folds <- function(train_indices, test_pct, m) {
-    n_train <- length(train_indices)
-    n_test <- floor(n_train * test_pct)
 
-    # For each fold, randomly select test set
-    shuffled_indices <- sample(train_indices)
-    test_indices <- shuffled_indices[1:n_test]
-    inner_train_indices <- shuffled_indices[(n_test + 1):length(shuffled_indices)]
-
-    fold_size <- floor(length(inner_train_indices) / m)
-    inner_folds <- vector("list", m)
-
-    for (i in 1:m) {
-        start_idx <- (i-1) * fold_size + 1
-        if (i == m) {
-            fold_train <- inner_train_indices[start_idx:length(inner_train_indices)]
-        } else {
-            end_idx <- i * fold_size
-            fold_train <- inner_train_indices[start_idx:end_idx]
-        }
-
-        inner_folds[[i]] <- list(
-            train = fold_train,
-            test = test_indices
-        )
+#' Memory-efficient dataset subsetting
+#' @param datasets List of datasets
+#' @param indices Indices to subset
+#' @param batch_size Batch size for data loading
+#' @return Subsetted datasets
+subset_datasets <- function(datasets, indices, batch_size = 32) {
+    if (is.null(datasets)) stop("Null datasets provided")
+    if (length(indices) == 0) stop("Empty indices provided")
+    
+    # Process in batches if dataset is large
+    if (length(indices) > 1000) {
+        chunk_size <- 1000
+        chunks <- split(indices, ceiling(seq_along(indices)/chunk_size))
+        
+        result <- lapply(datasets, function(dataset) {
+            if (is.null(dataset)) return(NULL)
+            
+            combined_result <- NULL
+            for (chunk in chunks) {
+                chunk_result <- if (inherits(dataset, "torch_tensor")) {
+                    dataset[chunk, ]
+                } else {
+                    dataset[chunk, ]
+                }
+                
+                combined_result <- if (is.null(combined_result)) {
+                    chunk_result
+                } else {
+                    rbind(combined_result, chunk_result)
+                }
+                
+                gc()
+            }
+            
+            combined_result
+        })
+        
+        return(result)
+    } else {
+        return(lapply(datasets, function(dataset) {
+            if (is.null(dataset)) return(NULL)
+            if (inherits(dataset, "torch_tensor")) {
+                dataset[indices, ]
+            } else {
+                dataset[indices, ]
+            }
+        }))
     }
-
-    return(inner_folds)
 }
 
-
-
-#' Run nested cross-validation with memory optimization
+#' Run nested cross-validation
 #' @param model Neural network model
 #' @param datasets List of torch datasets
 #' @param config Configuration parameters
 #' @param cancer_type Current cancer type
+#' @param outcome_type Either "binary" or "survival"
 #' @param validation_pct Percentage for validation
 #' @param test_pct Percentage for testing
 #' @param seed Optional seed for reproducibility
@@ -376,242 +575,164 @@ create_inner_folds <- function(train_indices, test_pct, m) {
 #' @param batch_size Batch size for data loading
 #' @return List of results and models
 run_nested_cv <- function(model, datasets, config, cancer_type, 
-                         validation_pct = 0.1, test_pct = 0.2, seed = NULL,
-                         max_workers = 2, batch_size = 32) {
+                         outcome_type = "binary",
+                         validation_pct = 0.1, test_pct = 0.2, 
+                         seed = NULL, max_workers = 2, batch_size = 32) {
     
-    # Clear memory at start
+    # Clear memory and set up parallel processing
     gc()
+    options(future.globals.maxSize = 2000 * 1024^2)
     
-    # Set memory limits for parallel processing
-    options(future.globals.maxSize = 2000 * 1024^2)  # 2GB limit per worker
-    
-    # Limit number of parallel workers based on available memory
+    # Configure workers based on available memory
     available_memory <- as.numeric(system("free -g | awk 'NR==2 {print $4}'", intern=TRUE))
-    suggested_workers <- min(max_workers, floor(available_memory / 4))  # Assume 4GB per worker
-    actual_workers <- max(1, suggested_workers)  # Ensure at least 1 worker
-    
+    actual_workers <- max(1, min(max_workers, floor(available_memory / 4)))
     message(sprintf("Using %d workers based on available memory", actual_workers))
     
-    # Find the event column index
-    event_col_idx <- which(datasets$clinical_features == "demographics_vital_status_alive")
-    if (length(event_col_idx) == 0) {
-        stop("Could not find 'event' column in clinical features")
-    }
-    
-    # Extract stratification information efficiently
-    stratify <- if (!is.null(datasets$clinical)) {
-        clinical_matrix <- as.array(datasets$clinical$cpu())
-        result <- clinical_matrix[, event_col_idx]
-        rm(clinical_matrix)
-        gc()
-        result
-    } else {
-        NULL
-    }
+    # Get stratification vector
+    stratify <- get_stratification_vector(datasets, outcome_type)
     
     # Get total number of samples
     n_samples <- dim(as.array(datasets[["clinical"]]$cpu()))[1]
     
-    # Extract parameters from config
-    n_repeats <- config$cv_params$outer_repeats
-    n_outer_folds <- config$cv_params$outer_folds
-    n_inner_folds <- config$cv_params$inner_folds
-    
     # Create CV splits
     cv_splits <- create_cv_splits(
         n_samples = n_samples,
-        n_repeats = n_repeats,
-        n_outer_folds = n_outer_folds,
-        n_inner_folds = n_inner_folds,
+        n_repeats = config$cv_params$outer_repeats,
+        n_outer_folds = config$cv_params$outer_folds,
+        n_inner_folds = config$cv_params$inner_folds,
         validation_pct = validation_pct,
         test_pct = test_pct,
         stratify = stratify,
         seed = seed
     )
     
-    
-    # Set up parallel processing with memory limits
+    # Set up parallel processing
     plan(multisession, workers = actual_workers)
     
-    # Function to clear torch CUDA cache if available
-    clear_cuda_memory <- function() {
-        if (torch::cuda_is_available()) {
-            torch::cuda_empty_cache()
-        }
-        gc()
-    }
-    
-    # Process each repeat sequentially to manage memory
+    # Process each repeat
     results <- vector("list", length(cv_splits))
     
-    #for (repeat_idx in seq_along(cv_splits)) {
-    for (repeat_idx in 1) {
-    message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
+    for (repeat_idx in seq_along(cv_splits)) {
+        message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
         
         repeat_split <- cv_splits[[repeat_idx]]
         
-        # Process outer folds in parallel with memory management
+        # Process outer folds in parallel
         outer_results <- future_lapply(seq_along(repeat_split$outer_splits), 
                                      function(fold_idx) {
-            # Clear memory at start of each fold
-            clear_cuda_memory()
-            
+            model_copy <- model$create_copy()
             outer_split <- repeat_split$outer_splits[[fold_idx]]
             
-            # Process inner folds with memory management
-            inner_results <- lapply(seq_along(outer_split$inner_folds), 
-                                  function(inner_fold_idx) {
-                # Clear memory before each inner fold
-                clear_cuda_memory()
+            # Process inner folds
+            inner_results <- lapply(outer_split$inner_folds, function(inner_fold) {
+                inner_model <- model$create_copy()
                 
-                model_copy <- model$clone()
-                inner_fold <- outer_split$inner_folds[[inner_fold_idx]]
-                
-                # Create datasets with memory-efficient subset function
-                inner_train_data <- subset_datasets(
-                    datasets, inner_fold, 
-                    batch_size = batch_size
-                )
-                inner_val_data <- subset_datasets(
-                    datasets, 
-                    setdiff(outer_split$train_idx, inner_fold),
-                    batch_size = batch_size
-                )
+                # Create datasets
+                inner_train_data <- subset_datasets(datasets, inner_fold$train_idx, batch_size)
+                inner_val_data <- subset_datasets(datasets, inner_fold$test_idx, batch_size)
                 
                 # Train and evaluate
                 trained_model <- train_model(
-                    model = model_copy,
+                    model = inner_model,
                     train_data = inner_train_data,
                     val_data = inner_val_data,
                     config = config,
-                    batch_size = batch_size
+                    outcome_type = outcome_type
                 )
                 
-                result <- evaluate_model(trained_model, inner_val_data)
-                
                 # Clean up
-                rm(model_copy, inner_train_data, inner_val_data, trained_model)
-                clear_cuda_memory()
+                rm(inner_model, inner_train_data, inner_val_data)
+                gc()
                 
-                result
+                trained_model
             })
             
-            # Select best hyperparameters
-            best_params <- select_best_hyperparameters(inner_results)
-            
             # Train final model for outer fold
-            model_copy <- model$clone()
-            outer_train_data <- subset_datasets(
-                datasets, outer_split$train_idx,
-                batch_size = batch_size
-            )
-            outer_test_data <- subset_datasets(
-                datasets, outer_split$test_idx,
-                batch_size = batch_size
-            )
+            outer_train_data <- subset_datasets(datasets, outer_split$train_idx, batch_size)
+            outer_test_data <- subset_datasets(datasets, outer_split$test_idx, batch_size)
             
             final_model <- train_model(
                 model = model_copy,
                 train_data = outer_train_data,
                 val_data = outer_test_data,
-                config = update_config(config, best_params),
-                batch_size = batch_size
+                config = config,
+                outcome_type = outcome_type
             )
             
-            # Evaluate and clean up
-            test_results <- evaluate_model(final_model, outer_test_data)
+            # Save intermediate results
+            results_dir <- file.path(config$main$paths$results_dir, cancer_type)
+            saveRDS(
+                final_model,
+                file.path(results_dir, sprintf("repeat_%d_fold_%d_model.rds", 
+                                             repeat_idx, fold_idx))
+            )
             
+            # Clean up
             rm(model_copy, outer_train_data, outer_test_data)
-            clear_cuda_memory()
+            gc()
             
-            list(
-                fold = fold_idx,
-                model = final_model,
-                results = test_results,
-                best_params = best_params,
-                inner_results = inner_results
-            )
+            final_model
         })
         
         # Evaluate validation set
-        best_outer_model <- select_best_model(outer_results)
-        validation_data <- subset_datasets(
-            datasets, repeat_split$validation,
-            batch_size = batch_size
-        )
-        validation_results <- evaluate_model(best_outer_model, validation_data)
+        validation_data <- subset_datasets(datasets, repeat_split$validation, batch_size)
+        best_model <- select_best_model(outer_results)
+        validation_results <- evaluate_model(best_model, validation_data, outcome_type)
         
-        # Store results for this repeat
+        # Store results
         results[[repeat_idx]] <- list(
             repeat_idx = repeat_idx,
             outer_results = outer_results,
             validation_results = validation_results,
-            best_model = best_outer_model
+            best_model = best_model
         )
         
-        # Clean up after each repeat
-        rm(best_outer_model, validation_data)
-        clear_cuda_memory()
-        
-        # Save intermediate results
+        # Save results
         saveRDS(
             results[[repeat_idx]],
-            file.path(
-                config$main$paths$results_dir,
-                cancer_type,
-                sprintf("repeat_%d_results.rds", repeat_idx)
-            )
+            file.path(config$main$paths$results_dir, cancer_type,
+                     sprintf("repeat_%d_results.rds", repeat_idx))
         )
     }
     
     # Aggregate results
     final_results <- aggregate_cv_results(results)
-    
-    # Select final best model
     final_model <- select_final_model(results)
     
-    # Save final results
-    results_dir <- file.path(config$main$paths$results_dir, cancer_type)
-    dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
-    
-    saveRDS(cv_splits, file.path(results_dir, "cv_splits.rds"))
-    
-    return(list(
+    list(
         results = final_results,
         final_model = final_model,
         cv_splits = cv_splits,
         raw_results = results
-    ))
-}
-
-#' Helper function to update configuration with new hyperparameters
-#' @param config Original configuration
-#' @param new_params New hyperparameters
-#' @return Updated configuration
-
-update_config <- function(config, new_params) {
-    if (is.null(new_params)) return(config)
-    
-    # Deep copy of config
-    new_config <- config
-    
-    # Update hyperparameters
-    new_config$model$hyperparameters <- modifyList(
-        new_config$model$hyperparameters,
-        new_params
     )
-    
-    return(new_config)
 }
 
-#' Helper function to aggregate CV results
+#' Select best model based on validation performance
+#' @param models List of trained models
+#' @return Best performing model
+select_best_model <- function(models) {
+    performances <- sapply(models, function(m) m$best_val_loss)
+    best_idx <- which.min(performances)
+    models[[best_idx]]$model
+}
+
+#' Select final model from all repeats
+#' @param results List of results from all repeats
+#' @return Best performing model
+select_final_model <- function(results) {
+    performances <- sapply(results, function(r) r$validation_results$metrics$primary_metric)
+    best_repeat <- which.max(performances)
+    results[[best_repeat]]$best_model
+}
+
+#' Aggregate CV results
 #' @param results List of results from all repeats
 #' @return Aggregated results summary
 aggregate_cv_results <- function(results) {
-    # Extract metrics from all levels
+    # Extract metrics
     validation_metrics <- lapply(results, function(r) r$validation_results$metrics)
     outer_metrics <- lapply(results, function(r) {
-        lapply(r$outer_results, function(o) o$results$metrics)
+        lapply(r$outer_results, function(o) o$history[[length(o$history)]])
     })
     
     # Calculate summary statistics
@@ -625,221 +746,361 @@ aggregate_cv_results <- function(results) {
         sd = apply(do.call(rbind, unlist(outer_metrics, recursive = FALSE)), 2, sd)
     )
     
-    # Collect hyperparameter statistics
-    hyper_params <- lapply(results, function(r) {
-        lapply(r$outer_results, function(o) o$best_params)
-    })
-    
-    return(list(
+    list(
         validation_summary = validation_summary,
-        outer_summary = outer_summary,
-        hyperparameter_summary = summarize_hyperparameters(hyper_params)
-    ))
-}
-
-#' Helper function to summarize hyperparameter selections
-#' @param hyper_params List of hyperparameters from all folds
-#' @return Summary of hyperparameter selections
-summarize_hyperparameters <- function(hyper_params) {
-    # Flatten the nested list of hyperparameters
-    flat_params <- unlist(hyper_params, recursive = FALSE)
-    
-    # For each hyperparameter, calculate statistics
-    param_names <- unique(unlist(lapply(flat_params, names)))
-    
-    lapply(param_names, function(param) {
-        values <- sapply(flat_params, function(p) p[[param]])
-        if (is.numeric(values)) {
-            list(
-                mean = mean(values),
-                sd = sd(values),
-                median = median(values),
-                min = min(values),
-                max = max(values)
-            )
-        } else {
-            # For categorical parameters, calculate frequencies
-            table(values)
-        }
-    })
-}
-
-#' Memory-efficient dataset subsetting
-#' @param datasets List of datasets
-#' @param indices Indices to subset
-#' @param batch_size Batch size for data loading
-#' @return Subsetted datasets
-subset_datasets <- function(datasets, indices, batch_size = 32) {
-    if (is.null(datasets)) stop("Null datasets provided")
-    if (length(indices) == 0) stop("Empty indices provided")
-    
-    # Process in batches if dataset is large
-    if (length(indices) > 1000) {
-        # Process in chunks
-        chunk_size <- 1000
-        chunks <- split(indices, ceiling(seq_along(indices)/chunk_size))
-        
-        result <- lapply(datasets, function(dataset) {
-            if (is.null(dataset)) return(NULL)
-            
-            # Process each chunk
-            combined_result <- NULL
-            for (chunk in chunks) {
-                chunk_result <- if (inherits(dataset, "torch_tensor")) {
-                    dataset[chunk, ]
-                } else {
-                    dataset[chunk, ]
-                }
-                
-                if (is.null(combined_result)) {
-                    combined_result <- chunk_result
-                } else {
-                    combined_result <- rbind(combined_result, chunk_result)
-                }
-                
-                # Clear memory after each chunk
-                gc()
-            }
-            
-            combined_result
-        })
-        
-        return(result)
-    } else {
-        # Process small datasets directly
-        return(lapply(datasets, function(dataset) {
-            if (is.null(dataset)) return(NULL)
-            if (inherits(dataset, "torch_tensor")) {
-                dataset[indices, ]
-            } else {
-                dataset[indices, ]
-            }
-        }))
-    }
-}
-
-
-#' Select best hyperparameters from inner CV results
-#' @param inner_results List of inner CV results
-#' @return Best hyperparameter configuration
-select_best_hyperparameters <- function(inner_results) {
-    # Extract performance metrics
-    performances <- sapply(inner_results, function(x) x$metric)
-    
-    # Select best configuration
-    best_idx <- which.max(performances)
-    inner_results[[best_idx]]$params
-}
-
-#' Update configuration with new hyperparameters
-#' @param config Original configuration
-#' @param new_params New hyperparameters
-#' @return Updated configuration
-update_config <- function(config, new_params) {
-    # Deep copy of config
-    new_config <- config
-    
-    # Update hyperparameters
-    new_config$model$hyperparameters <- modifyList(
-        new_config$model$hyperparameters,
-        new_params
+        outer_summary = outer_summary
     )
-    
-    return(new_config)
 }
 
-#' Aggregate results from all CV repeats
-#' @param results List of results from all repeats
-#' @return Aggregated results
-aggregate_cv_results <- function(results) {
-    # Extract metrics from all levels
-    metrics <- list(
-        validation = lapply(results, function(r) r$validation_results$metrics),
-        outer = lapply(results, function(r) {
-            lapply(r$outer_results, function(o) o$results$metrics)
-        })
-    )
-    
-    # Calculate summary statistics
-    summary_stats <- list(
-        validation = list(
-            mean = colMeans(do.call(rbind, metrics$validation)),
-            sd = apply(do.call(rbind, metrics$validation), 2, sd)
-        ),
-        outer = list(
-            mean = colMeans(do.call(rbind, unlist(metrics$outer, recursive = FALSE))),
-            sd = apply(do.call(rbind, unlist(metrics$outer, recursive = FALSE)), 2, sd)
-        )
-    )
-    
-    return(list(
-        metrics = metrics,
-        summary = summary_stats
-    ))
-}
-
-#' Select final model based on validation performance
-#' @param results List of results from all repeats
-#' @return Best performing model
-select_final_model <- function(results) {
-    # Extract validation performances
-    performances <- sapply(results, function(r) r$validation_results$metrics$primary_metric)
-    
-    # Select best model
-    best_repeat <- which.max(performances)
-    results[[best_repeat]]$best_model
-}
-
-# Need to add evaluate_model function
-
-evaluate_model <- function(model, data) {
+#' Evaluate model performance
+#' @param model Trained model
+#' @param data Test data
+#' @param outcome_type Either "binary" or "survival"
+#' @return List of evaluation metrics and predictions
+evaluate_model <- function(model, data, outcome_type = "binary") {
     model$eval()
     loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE)
     
-    all_predictions <- list()
-    all_targets <- list()
+    predictions <- list()
+    targets <- list()
+    times <- list()
+    events <- list()
+    attention_weights <- list()
     
     with_no_grad({
         coro::loop(for (batch in loader) {
             output <- model(batch$data, batch$masks)
-            all_predictions[[length(all_predictions) + 1]] <- output$predictions$cpu()
-            all_targets[[length(all_targets) + 1]] <- batch$target$cpu()
+            predictions[[length(predictions) + 1]] <- output$predictions$cpu()
+            
+            if (outcome_type == "binary") {
+                targets[[length(targets) + 1]] <- batch$target$cpu()
+            } else {
+                times[[length(times) + 1]] <- batch$time$cpu()
+                events[[length(events) + 1]] <- batch$event$cpu()
+            }
+            
+            if (!is.null(output$attention_weights)) {
+                attention_weights[[length(attention_weights) + 1]] <- output$attention_weights
+            }
         })
     })
     
-    predictions <- torch_cat(all_predictions, dim = 1)
-    targets <- torch_cat(all_targets, dim = 1)
+    # Concatenate results
+    all_predictions <- torch_cat(predictions, dim = 1)
     
-    # Calculate metrics
-    metrics <- list(
-        primary_metric = calculate_primary_metric(predictions, targets),
-        additional_metrics = calculate_additional_metrics(predictions, targets)
-    )
+    if (outcome_type == "binary") {
+        all_targets <- torch_cat(targets, dim = 1)
+        metrics <- calculate_binary_metrics(all_predictions, all_targets)
+        
+        results <- list(
+            metrics = metrics,
+            predictions = all_predictions,
+            targets = all_targets
+        )
+    } else {
+        all_times <- torch_cat(times, dim = 1)
+        all_events <- torch_cat(events, dim = 1)
+        metrics <- calculate_survival_metrics(all_predictions, all_times, all_events)
+        
+        results <- list(
+            metrics = metrics,
+            predictions = all_predictions,
+            times = all_times,
+            events = all_events
+        )
+    }
     
-    return(list(
-        metrics = metrics,
-        predictions = predictions,
-        targets = targets
-    ))
+    # Add attention weights if available
+    if (length(attention_weights) > 0) {
+        results$attention_weights <- attention_weights
+    }
+    
+    results
 }
 
-select_best_model <- function(outer_results) {
-    if (length(outer_results) == 0) {
-        stop("No outer results provided for model selection")
-    }
+#' Analyze feature importance using integrated gradients
+#' @param model Trained model
+#' @param data Reference data
+#' @param n_steps Number of steps for path integral
+#' @return Feature importance scores
+analyze_feature_importance <- function(model, data, n_steps = 50) {
+    model$eval()
     
-    performances <- sapply(outer_results, function(x) {
-        if (is.null(x$results$metrics$primary_metric)) {
-            stop("Missing primary metric in results")
+    # Get baseline (zeros) and reference data
+    baseline <- lapply(data, function(x) {
+        if (inherits(x, "torch_tensor")) {
+            torch_zeros_like(x)
+        } else {
+            NULL
         }
-        x$results$metrics$primary_metric
     })
     
-    best_idx <- which.max(performances)
-    if (length(best_idx) == 0) {
-        stop("Could not determine best model")
+    # Calculate integrated gradients
+    importance_scores <- list()
+    
+    with_no_grad({
+        for (modality in names(data)) {
+            if (!is.null(baseline[[modality]])) {
+                # Create path points
+                alphas <- seq(0, 1, length.out = n_steps)
+                gradients <- torch_zeros_like(data[[modality]])
+                
+                for (alpha in alphas) {
+                    # Interpolate between baseline and input
+                    interp_input <- baseline[[modality]] + 
+                        alpha * (data[[modality]] - baseline[[modality]])
+                    interp_input$requires_grad_(TRUE)
+                    
+                    # Forward pass
+                    output <- model(interp_input)
+                    
+                    # Calculate gradients
+                    grad <- torch_autograd_grad(
+                        output$predictions,
+                        interp_input,
+                        torch_ones_like(output$predictions)
+                    )[[1]]
+                    
+                    gradients <- gradients + grad
+                }
+                
+                # Calculate importance scores
+                importance <- (data[[modality]] - baseline[[modality]]) * 
+                    gradients / n_steps
+                
+                importance_scores[[modality]] <- importance$abs()$mean(dim = 1)
+            }
+        }
+    })
+    
+    importance_scores
+}
+
+#' Analyze attention patterns
+#' @param attention_weights List of attention weights
+#' @param feature_names List of feature names by modality
+#' @return Analysis of attention patterns
+analyze_attention_patterns <- function(attention_weights, feature_names) {
+    # Initialize results
+    attention_analysis <- list()
+    
+    # Analyze self-attention patterns for each modality
+    if (!is.null(attention_weights$self_attention)) {
+        attention_analysis$self_attention <- lapply(names(attention_weights$self_attention), 
+                                                  function(modality) {
+            weights <- attention_weights$self_attention[[modality]]
+            
+            # Average attention weights across heads and batches
+            avg_weights <- torch_mean(weights, dim = c(1, 2))
+            
+            # Get top attended features
+            top <- torch_topk(avg_weights, k = 10)
+            top_values <- top[[1]]  # First element contains values
+            top_indices <- top[[2]]  # Second element contains indices
+            
+            # Match with feature names
+            top_features <- feature_names[[modality]][top_indices$cpu()$numpy()]
+            
+            list(
+                modality = modality,
+                top_features = top_features,
+                attention_scores = top_values$cpu()$numpy()
+            )
+        })
     }
     
-    return(outer_results[[best_idx]]$model)
+    # Analyze cross-attention patterns
+    if (!is.null(attention_weights$cross_attention)) {
+        # Average across heads and batches
+        avg_cross_attention <- torch_mean(attention_weights$cross_attention, 
+                                        dim = c(1, 2))
+        
+        # Get top cross-modal interactions
+        top <- torch_topk(avg_cross_attention$view(-1), k = 10)
+        top_values <- top[[1]]
+        top_indices <- top[[2]]
+        
+        # Convert linear indices to 2D indices
+        rows <- top_indices %/% avg_cross_attention$size(2)
+        cols <- top_indices %% avg_cross_attention$size(2)
+        
+        # Match with modality names
+        modality_names <- names(feature_names)
+        cross_modal_interactions <- lapply(1:length(top_values), function(i) {
+            list(
+                from_modality = modality_names[rows[i] + 1],
+                to_modality = modality_names[cols[i] + 1],
+                attention_score = top_values[i]$cpu()$numpy()
+            )
+        })
+        
+        attention_analysis$cross_attention <- cross_modal_interactions
+    }
+    
+    attention_analysis
+}
+
+
+#' Generate performance visualization
+#' @param results CV results
+#' @param outcome_type Either "binary" or "survival"
+#' @return List of plots
+generate_performance_visualization <- function(results, outcome_type = "binary") {
+    library(ggplot2)
+    library(tidyr)
+    library(dplyr)
+
+    plots <- list()
+
+    # Convert results to data frame
+    metrics_df <- do.call(rbind, lapply(1:length(results), function(i) {
+        iteration_results <- results[[i]]
+
+        # Extract validation metrics
+        val_metrics <- as.data.frame(t(unlist(iteration_results$validation_results$metrics)))
+        val_metrics$iteration <- i
+        val_metrics$fold <- "validation"
+
+        # Extract outer fold metrics
+        outer_metrics <- do.call(rbind, lapply(1:length(iteration_results$outer_results),
+                                             function(j) {
+            fold_metrics <- as.data.frame(t(unlist(
+                iteration_results$outer_results[[j]]$history[[
+                    length(iteration_results$outer_results[[j]]$history)
+                ]]
+            )))
+            fold_metrics$iteration <- i
+            fold_metrics$fold <- paste0("fold_", j)
+            fold_metrics
+        }))
+
+        rbind(val_metrics, outer_metrics)
+    }))
+
+    # Create performance plots based on outcome type
+    if (outcome_type == "binary") {
+        # ROC curve plot
+        plots$roc <- ggplot(metrics_df, aes(x = 1 - specificity, y = sensitivity,
+                                          color = fold)) +
+            geom_line() +
+            geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+            theme_minimal() +
+            labs(title = "ROC Curves across CV Folds",
+                 x = "False Positive Rate",
+                 y = "True Positive Rate")
+
+        # Metrics boxplot
+        long_metrics <- metrics_df %>%
+            pivot_longer(cols = c("accuracy", "precision", "recall", "f1", "auc"),
+                        names_to = "metric", values_to = "value")
+
+        plots$metrics <- ggplot(long_metrics, aes(x = metric, y = value)) +
+            geom_boxplot() +
+            theme_minimal() +
+            labs(title = "Performance Metrics Distribution",
+                 x = "Metric", y = "Value")
+
+    } else {
+        # Kaplan-Meier curves
+        plots$km <- ggplot(metrics_df, aes(x = time, y = survival_prob,
+                                         color = risk_group)) +
+            geom_step() +
+            facet_wrap(~iteration) +
+            theme_minimal() +
+            labs(title = "Kaplan-Meier Curves by Risk Group",
+                 x = "Time", y = "Survival Probability")
+
+        # C-index distribution
+        plots$cindex <- ggplot(metrics_df, aes(x = fold, y = c_index)) +
+            geom_boxplot() +
+            theme_minimal() +
+            labs(title = "C-index Distribution across Folds",
+                 x = "Fold", y = "C-index")
+    }
+
+    plots
+}
+
+#' Save complete analysis results
+#' @param results CV results
+#' @param cancer_type Cancer type
+#' @param config Configuration
+#' @param output_dir Output directory
+save_analysis_results <- function(results, cancer_type, config, output_dir) {
+    # Create output directory
+    dir.create(file.path(output_dir, cancer_type), recursive = TRUE, 
+              showWarnings = FALSE)
+    
+    # Save model performance metrics
+    saveRDS(results$results, 
+            file.path(output_dir, cancer_type, "performance_metrics.rds"))
+    
+    # Save feature importance analysis
+    if (!is.null(results$feature_importance)) {
+        saveRDS(results$feature_importance,
+                file.path(output_dir, cancer_type, "feature_importance.rds"))
+    }
+    
+    # Save attention analysis
+    if (!is.null(results$attention_analysis)) {
+        saveRDS(results$attention_analysis,
+                file.path(output_dir, cancer_type, "attention_analysis.rds"))
+    }
+    
+    # Save visualizations
+    if (!is.null(results$plots)) {
+        for (plot_name in names(results$plots)) {
+            ggsave(
+                filename = file.path(output_dir, cancer_type, 
+                                   paste0(plot_name, ".pdf")),
+                plot = results$plots[[plot_name]],
+                width = 10,
+                height = 8
+            )
+        }
+    }
+    
+    # Save configuration
+    saveRDS(config, file.path(output_dir, cancer_type, "config.rds"))
+    
+    # Generate and save summary report
+    report <- generate_summary_report(results, cancer_type, config)
+    writeLines(report, file.path(output_dir, cancer_type, "summary_report.txt"))
+}
+
+#' Generate summary report
+#' @param results CV results
+#' @param cancer_type Cancer type
+#' @param config Configuration
+#' @return Text report
+generate_summary_report <- function(results, cancer_type, config) {
+    report <- c(
+        "=== Analysis Summary Report ===\n",
+        sprintf("Cancer Type: %s\n", cancer_type),
+        sprintf("Date: %s\n", Sys.Date()),
+        "\nConfiguration:",
+        sprintf("- Outcome type: %s", config$model$outcome_type),
+        sprintf("- Number of repeats: %d", config$cv_params$outer_repeats),
+        sprintf("- Number of outer folds: %d", config$cv_params$outer_folds),
+        sprintf("- Number of inner folds: %d", config$cv_params$inner_folds),
+        "\nPerformance Summary:",
+        sprintf("- Mean validation performance: %.3f", 
+                mean(results$results$validation_summary$mean)),
+        sprintf("- SD validation performance: %.3f", 
+                mean(results$results$validation_summary$sd)),
+        "\nTop Features:",
+        paste("- ", names(head(sort(results$feature_importance, decreasing = TRUE), 10)),
+              collapse = "\n"),
+        "\nModel Architecture:",
+        sprintf("- Number of parameters: %d", 
+                sum(sapply(results$final_model$parameters, function(p) prod(p$size())))),
+        "\nTraining Details:",
+        sprintf("- Best epoch: %d", 
+                which.min(results$final_model$history$val_loss)),
+        sprintf("- Final learning rate: %.6f", 
+                results$final_model$history$lr[length(results$final_model$history$lr)])
+    )
+    
+    paste(report, collapse = "\n")
 }
 
