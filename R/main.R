@@ -14,7 +14,9 @@ source("R/modules/data_handling/expression_processor.R")
 source("R/modules/data_handling/mutation_processor.R")
 source("R/modules/data_handling/methylation_processor.R")
 source("R/modules/data_handling/mirna_processor.R")
+source("R/modules/data_handling/multimodal_dataset.R")
 source("R/modules/helper_functions/misc.R")
+
 set.seed(123)
 
 
@@ -39,16 +41,16 @@ main <- function(download=FALSE) {
     for (cancer_type in cancer_types) {
         message(sprintf("\nProcessing data for %s:", cancer_type))
         
+        # Process clinical data with common features
+        message("\nProcessing clinical data...")
+        processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type,
+                                                                      impute = FALSE,
+                                                                      impute_method = "missing_category")
         # Process CNV data
         message("\nProcessing CNV data...")
         processed_data[[cancer_type]]$cnv <- process_cnv_data(cancer_type, preprocessing_method = "raw")
         
-        # Process clinical data with common features
-        message("\nProcessing clinical data...")
-        processed_data[[cancer_type]]$clinical <- process_clinical_data(cancer_type,  
-                                                                      impute = FALSE, 
-                                                                      impute_method = "missing_category")
-        # Process expression data
+	# Process expression data
         message("\nProcessing gene expression data...")
         processed_data[[cancer_type]]$expression <- process_expression_data(cancer_type, 
                                                                           min_tpm = 1, 
@@ -75,7 +77,7 @@ main <- function(download=FALSE) {
             cnv = file.path(base_dir, cancer_type, "processed", "cnv_genes_dnn_raw.tsv")
         )
         
-        # Validate sample consistency and get filtered data
+        # Validate sample consistency
         message("\nValidating sample consistency across data modalities...")
         validate_sample_consistency(data_files, cancer_type)
         
@@ -95,7 +97,8 @@ main <- function(download=FALSE) {
 
 	# Convert to torch datasets
         message("\nConverting data to torch format...")
-        torch_datasets <- create_torch_datasets(
+        
+	torch_datasets <- create_torch_datasets(
             processed_data[[cancer_type]], 
             config$model
         )
@@ -118,7 +121,7 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
-	max_workers = 2,      # Limit parallel workers
+	max_workers = 6,      # Limit parallel workers
         batch_size = 32,
 	seed = NULL # using seed defined at the top for now
 	)
