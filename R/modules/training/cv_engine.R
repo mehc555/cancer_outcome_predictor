@@ -473,7 +473,6 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         validation_pct = validation_pct,
         test_pct = test_pct
     )
-    print(repeated_splits$validation_pct)
     return(repeated_splits)
 }
 
@@ -483,7 +482,6 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
 #' @param stratify Stratification vector
 #' @param size Size of split
 #' @return Vector of indices for split
-
 
 create_stratified_split <- function(indices, stratify, size) {
     # Count total instances of each class
@@ -543,43 +541,117 @@ create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct =
 }
 
 
-#' Memory-efficient dataset subsetting
-#' @param datasets List of datasets
+#' Memory-efficient dataset subsetting with proper tensor and feature handling
+#' @param datasets MultiModalDataset object
 #' @param indices Indices to subset
 #' @param batch_size Batch size for data loading
-#' @return Subsetted datasets
+#' @return Subsetted MultiModalDataset
 
 subset_datasets <- function(datasets, indices, batch_size = 32) {
     if (!inherits(datasets, "MultiModalDataset")) {
         stop("datasets must be a MultiModalDataset object")
     }
-    
-    # Convert indices to 1-based if they're 0-based
+
+    # Convert indices to integer vector if necessary
     indices <- as.integer(indices)
-    if (any(indices == 0)) indices <- indices + 1
     
-    # Create new data list with subsetted tensors
+    # Create new data list for subsetted dataset
     subsetted_data <- list()
     
-    # Process each field in the dataset
-    for (name in names(datasets$data)) {
-        tensor <- datasets$data[[name]]
-        if (inherits(tensor, "torch_tensor")) {
-            # Subset the tensor
-            subsetted_data[[name]] <- tensor[indices,]
+    # First, copy all feature names
+    for (modality in names(datasets$features)) {
+        feature_name <- paste0(modality, "_features")
+        # Ensure features are character vectors
+        subsetted_data[[feature_name]] <- as.character(datasets$features[[modality]])
+    }
+    
+    # Process each data modality
+    modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
+    
+    # Debug info before processing
+    cat("Processing dataset subsetting:\n")
+    cat(sprintf("Original dataset size: %d samples\n", datasets$n_samples))
+    cat(sprintf("Subsetting to %d samples\n", length(indices)))
+    
+    for (modality in modalities) {
+        if (!is.null(datasets$data[[modality]])) {
+            tryCatch({
+                # Get original tensor
+                original_tensor <- datasets$data[[modality]]
+                
+                if (!inherits(original_tensor, "torch_tensor")) {
+                    stop(sprintf("Data for modality %s is not a torch tensor", modality))
+                }
+                
+                # Create subset using indexing
+                subsetted_tensor <- original_tensor[indices,]
+                
+                # Store subsetted tensor
+                subsetted_data[[modality]] <- subsetted_tensor
+                
+                # Handle corresponding mask if it exists
+                mask_name <- paste0(modality, "_mask")
+                if (!is.null(datasets$data[[mask_name]])) {
+                    mask_tensor <- datasets$data[[mask_name]]
+                    subsetted_mask <- mask_tensor[indices,]
+                    subsetted_data[[mask_name]] <- subsetted_mask
+                }
+                
+                # Debug info
+                cat(sprintf("Processed %s: %s -> %s\n",
+                          modality,
+                          paste(dim(original_tensor), collapse="x"),
+                          paste(dim(subsetted_tensor), collapse="x")))
+                
+            }, error = function(e) {
+                warning(sprintf("Error processing modality %s: %s", modality, conditionMessage(e)))
+                return(NULL)
+            })
         }
     }
     
-    # Copy over feature names
-    for (name in names(datasets$features)) {
-        feature_name <- paste0(name, "_features")
-        subsetted_data[[feature_name]] <- datasets$features[[name]]
+    # Validate subsetted data before creating new dataset
+    if (length(subsetted_data) == 0) {
+        stop("No data was successfully subsetted")
     }
     
-    # Create new MultiModalDataset
-    MultiModalDataset(subsetted_data)
+    # We'll use the same class as the input dataset
+    new_dataset <- datasets$clone()
+    
+    # Update the data
+    new_dataset$data <- subsetted_data
+    
+    # Update sample information
+    new_dataset$n_samples <- length(indices)
+    
+    # Update sample IDs if they exist
+    if (!is.null(datasets$unified_sample_ids)) {
+        new_dataset$unified_sample_ids <- datasets$unified_sample_ids[indices]
+    }
+    
+    if (!is.null(datasets$sample_ids)) {
+        new_dataset$sample_ids <- lapply(datasets$sample_ids, function(ids) {
+            if (!is.null(ids)) ids[indices]
+        })
+    }
+    
+    # Update sample ID to index mapping
+    if (!is.null(datasets$sample_id_to_index)) {
+        new_mapping <- list()
+        for (id in new_dataset$unified_sample_ids) {
+            new_mapping[[id]] <- which(new_dataset$unified_sample_ids == id)
+        }
+        new_dataset$sample_id_to_index <- new_mapping
+    }
+    
+    # Verify the new dataset
+    if (new_dataset$n_samples != length(indices)) {
+        warning(sprintf("Created dataset has %d samples, expected %d",
+                      new_dataset$n_samples, length(indices)))
+    }
+    
+    return(new_dataset)
 }
-
 
 #' Run nested cross-validation
 #' @param model Neural network model
