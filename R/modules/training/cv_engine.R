@@ -10,23 +10,30 @@ library(glmnet)
 #' @param datasets Torch MultiModalDataset or list
 #' @param outcome_type Either "binary" or "survival"
 #' @return Vector for stratification
-
 get_stratification_vector <- function(datasets, outcome_type = "binary") {
-    if (!inherits(datasets, "MultiModalDataset")) {
-        stop("datasets must be a MultiModalDataset object")
+    # Handle both MultiModalDataset and list inputs
+    if (inherits(datasets, "MultiModalDataset")) {
+        clinical_data <- as.matrix(datasets$data$clinical$cpu())
+        clinical_features <- datasets$data$clinical_features
+    } else {
+        clinical_data <- as.matrix(datasets$clinical$cpu())
+        clinical_features <- datasets$clinical_features
     }
-
+    
     if (outcome_type == "binary") {
-        event_idx <- which(datasets$features$clinical == "demographics_vital_status_alive")
-        return(datasets$data$clinical[,event_idx]$cpu()$numpy())
+        event_col <- which(clinical_features == "demographics_vital_status_alive")
+        if (length(event_col) > 0) {
+            return(clinical_data[, event_col])
+        }
     } else if (outcome_type == "survival") {
         # For survival, stratify by event status
-        event_idx <- which(datasets$features$clinical == "event")
-        return(factor(datasets$data$clinical[,event_idx]$cpu()$numpy()))
+        event_col <- which(clinical_features == "event")
+        if (length(event_col) > 0) {
+            return(factor(clinical_data[, event_col]))
+        }
     }
     return(NULL)
 }
-
 
 
 #' Train model with multi-modal data
@@ -36,7 +43,6 @@ get_stratification_vector <- function(datasets, outcome_type = "binary") {
 #' @param config Training configuration
 #' @param outcome_type Either "binary" or "survival"
 #' @return Trained model and training history
-
 train_model <- function(model, train_data, val_data, config, outcome_type = "binary") {
   # Create data loaders
   train_loader <- dataloader(
@@ -81,13 +87,14 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     coro::loop(for (batch in train_loader) {
       optimizer$zero_grad()
 
-      # Forward pass with provided data and masks
+      # Forward pass
       output <- model(batch$data, batch$masks)
       
-      # Get correct target based on outcome type
+      # Compute loss based on outcome type
       if (outcome_type == "binary") {
-        loss <- nn_bce_with_logits_loss()(output$predictions, batch$event)
+        loss <- nn_bce_with_logits_loss()(output$predictions, batch$target)
       } else if (outcome_type == "survival") {
+        # Cox partial likelihood loss
         loss <- compute_cox_loss(output$predictions, batch$time, batch$event)
       }
 
@@ -96,11 +103,11 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       optimizer$step()
 
       # Record loss
-      train_losses <- c(train_losses, as.numeric(loss))
+      train_losses <- c(train_losses, loss$item())
 
       # Calculate additional metrics
       if (outcome_type == "binary") {
-        batch_metrics <- calculate_binary_metrics(output$predictions, batch$event)
+        batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
       } else {
         batch_metrics <- calculate_survival_metrics(output$predictions, batch$time, batch$event)
       }
@@ -121,21 +128,20 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
 
     with_no_grad({
       coro::loop(for (batch in val_loader) {
-        # Forward pass
         output <- model(batch$data, batch$masks)
         
         # Compute validation loss
         if (outcome_type == "binary") {
-          loss <- nn_bce_with_logits_loss()(output$predictions, batch$event)
+          loss <- nn_bce_with_logits_loss()(output$predictions, batch$target)
         } else if (outcome_type == "survival") {
           loss <- compute_cox_loss(output$predictions, batch$time, batch$event)
         }
         
-        val_losses <- c(val_losses, as.numeric(loss))
+        val_losses <- c(val_losses, loss$item())
 
         # Calculate validation metrics
         if (outcome_type == "binary") {
-          batch_metrics <- calculate_binary_metrics(output$predictions, batch$event)
+          batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
         } else {
           batch_metrics <- calculate_survival_metrics(output$predictions, batch$time, batch$event)
         }
@@ -323,13 +329,12 @@ calculate_survival_metrics <- function(predictions, times, events) {
 #' @param stratify Optional vector for stratification
 #' @param seed Optional seed for reproducibility
 #' @return List of CV split indices
-
-create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
+create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds, 
                            validation_pct = 0.3, test_pct = 0.3, stratify = NULL, seed = NULL) {
     if (!is.null(seed)) {
         set.seed(seed)
     }
-
+    
     # Input validation
     if (n_samples < 1) stop("n_samples must be positive")
     if (n_repeats < 1) stop("n_repeats must be positive")
@@ -337,7 +342,7 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
     if (n_inner_folds < 2) stop("n_inner_folds must be at least 2")
     if (validation_pct <= 0 || validation_pct >= 1) stop("validation_pct must be between 0 and 1")
     if (test_pct <= 0 || test_pct >= 1) stop("test_pct must be between 0 and 1")
-
+    
     repeated_splits <- lapply(1:n_repeats, function(r) {
         # First split: Validation vs rest
         validation_size <- floor(n_samples * validation_pct)
@@ -346,124 +351,104 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         } else {
             sample(1:n_samples, validation_size)
         }
-
-        # Get remaining indices after validation split
+        
+        # Get remaining indices
         remaining_indices <- setdiff(1:n_samples, validation_indices)
         remaining_samples <- length(remaining_indices)
-
-        # Second split: Test vs Training from remaining
+        
+        # Second split: Test vs Train from remaining
         test_size <- floor(remaining_samples * test_pct)
         test_indices <- if (!is.null(stratify)) {
-            remaining_stratify <- stratify[remaining_indices]
-            create_stratified_split(remaining_indices, remaining_stratify, test_size)
+            create_stratified_split(remaining_indices, stratify[remaining_indices], test_size)
         } else {
             sample(remaining_indices, test_size)
         }
-
-        # Get training indices
+        
         train_indices <- setdiff(remaining_indices, test_indices)
-
-        # Create outer folds
-        outer_folds <- lapply(1:n_outer_folds, function(k) {
-            # For each outer fold, create inner folds from the training data
-            inner_folds <- lapply(1:n_inner_folds, function(m) {
-                # Calculate inner test size
-                inner_test_size <- floor(length(train_indices) * test_pct)
-
-                # Create inner split
-                if (!is.null(stratify)) {
-                    train_stratify <- stratify[train_indices]
-                    inner_test_idx <- create_stratified_split(train_indices, train_stratify, inner_test_size)
-                } else {
-                    inner_test_idx <- sample(train_indices, inner_test_size)
-                }
-
-                inner_train_idx <- setdiff(train_indices, inner_test_idx)
-
-                list(
-                    train_idx = inner_train_idx,
-                    test_idx = inner_test_idx
-                )
-            })
-
+        
+        # Create outer folds - each uses full training set
+        outer_folds <- create_stratified_folds(
+            train_indices = train_indices,
+            stratify = if (!is.null(stratify)) stratify[train_indices] else NULL,
+            n_folds = n_outer_folds,
+            test_pct = test_pct
+        )
+        
+        # Add inner folds to each outer fold
+        outer_folds <- lapply(seq_along(outer_folds), function(k) {
+            inner_folds <- create_stratified_folds(
+                train_indices = outer_folds[[k]]$train_idx,
+                stratify = if (!is.null(stratify)) stratify[outer_folds[[k]]$train_idx] else NULL,
+                n_folds = n_inner_folds,
+                test_pct = test_pct
+            )
+            
             names(inner_folds) <- paste0("M-Fold-", 1:n_inner_folds)
-
+            
             list(
                 name = paste0("K-Fold-", k),
-                train_idx = train_indices,
-                test_idx = test_indices,
+                train_idx = outer_folds[[k]]$train_idx,
+                test_idx = test_indices,  # Use same test set for all K-folds
                 inner_folds = inner_folds
             )
         })
-
+        
         names(outer_folds) <- paste0("K-Fold-", 1:n_outer_folds)
-
+        
         # Print detailed structure for first repeat
         if (r == 1) {
             message("\n=== Initial Split ===")
             message(sprintf("Total samples: %d", n_samples))
-            message(sprintf("Validation set: %d samples (%.1f%%)",
+            message(sprintf("Validation set: %d samples (%.1f%%)", 
                           validation_size, 100 * validation_size/n_samples))
             message(sprintf("Remaining samples: %d", remaining_samples))
-
+            
             message("\n=== Second Split of Remaining Data ===")
-            message(sprintf("Test set: %d samples (%.1f%% of remaining)",
+            message(sprintf("Test set: %d samples (%.1f%% of remaining)", 
                           test_size, 100 * test_size/remaining_samples))
             message(sprintf("Training set: %d samples", length(train_indices)))
-
+            
             message("\n=== K-fold Structure ===")
             message(sprintf("Number of K-folds: %d", n_outer_folds))
-            message(sprintf("Full training set (each K-fold): %d samples",
+            message(sprintf("Full training set (each K-fold): %d samples", 
                           length(train_indices)))
-            message(sprintf("Fixed test set (all K-folds): %d samples",
+            message(sprintf("Fixed test set (all K-folds): %d samples", 
                           length(test_indices)))
-
+            
             message("\n=== M-fold Structure (per K-fold) ===")
             inner_test_size <- floor(length(train_indices) * test_pct)
             inner_train_size <- length(train_indices) - inner_test_size
             message(sprintf("Number of M-folds per K-fold: %d", n_inner_folds))
-            message(sprintf("Inner test size: %d samples (%.1f%% of training)",
+            message(sprintf("Inner test size: %d samples (%.1f%% of training)", 
                           inner_test_size, 100 * test_pct))
             message(sprintf("Inner train size: %d samples", inner_train_size))
-
+            
             if (!is.null(stratify)) {
                 message("\n=== Stratification Balance ===")
-
-                # Validation set distribution
-                val_table <- table(stratify[validation_indices])
-                message("Validation set distribution:")
-                for (s in names(val_table)) {
-                    message(sprintf("  - %s: %.1f%% (%d samples)",
-                                  s, 100 * val_table[s]/sum(val_table), val_table[s]))
-                }
-
-                # Test set distribution
-                test_table <- table(stratify[test_indices])
-                message("Test set distribution:")
-                for (s in names(test_table)) {
-                    message(sprintf("  - %s: %.1f%% (%d samples)",
-                                  s, 100 * test_table[s]/sum(test_table), test_table[s]))
-                }
-
-                # Training set distribution
-                train_table <- table(stratify[train_indices])
-                message("Training set distribution:")
-                for (s in names(train_table)) {
-                    message(sprintf("  - %s: %.1f%% (%d samples)",
-                                  s, 100 * train_table[s]/sum(train_table), train_table[s]))
+                strata <- unique(stratify)
+                for (split_name in c("Validation", "Test", "Training")) {
+                    indices <- switch(split_name,
+                                   "Validation" = validation_indices,
+                                   "Test" = test_indices,
+                                   "Training" = train_indices)
+                    counts <- table(stratify[indices])
+                    props <- prop.table(counts)
+                    message(sprintf("\n%s set distribution:", split_name))
+                    for (s in names(counts)) {
+                        message(sprintf("  - %s: %.1f%% (%d samples)", 
+                                      s, 100 * props[s], counts[s]))
+                    }
                 }
             }
         }
-
+        
         list(
             iteration = r,
             validation = validation_indices,
-            test = test_indices,
-            train = train_indices,
             outer_splits = outer_folds
         )
     })
-
+    
     attr(repeated_splits, "summary") <- list(
         n_samples = n_samples,
         n_repeats = n_repeats,
@@ -473,6 +458,7 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         validation_pct = validation_pct,
         test_pct = test_pct
     )
+    
     return(repeated_splits)
 }
 
@@ -482,20 +468,14 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
 #' @param stratify Stratification vector
 #' @param size Size of split
 #' @return Vector of indices for split
-
 create_stratified_split <- function(indices, stratify, size) {
-    # Count total instances of each class
-    class_counts <- table(stratify)
-    
-    # Calculate target size for each class to maintain proportions
-    class_sizes <- floor(size * class_counts / length(stratify))
-    
-    # Sample from each class separately
+    strata <- unique(stratify)
     split_indices <- c()
-    for (class in names(class_counts)) {
-        class_indices <- indices[stratify == class]
-        split_indices <- c(split_indices, 
-                          sample(class_indices, size = class_sizes[class]))
+    
+    for (stratum in strata) {
+        stratum_indices <- indices[stratify[indices] == stratum]
+        stratum_size <- floor(size * length(stratum_indices) / length(indices))
+        split_indices <- c(split_indices, sample(stratum_indices, stratum_size))
     }
     
     return(split_indices)
@@ -541,116 +521,57 @@ create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct =
 }
 
 
-#' Memory-efficient dataset subsetting with proper tensor and feature handling
-#' @param datasets MultiModalDataset object
+#' Memory-efficient dataset subsetting
+#' @param datasets List of datasets
 #' @param indices Indices to subset
 #' @param batch_size Batch size for data loading
-#' @return Subsetted MultiModalDataset
+#' @return Subsetted datasets
 
+#' Memory-efficient dataset subsetting
+#' @param datasets List of datasets
+#' @param indices Indices to subset
+#' @param batch_size Batch size for data loading
+#' @return Subsetted torch dataset
 subset_datasets <- function(datasets, indices, batch_size = 32) {
-    if (!inherits(datasets, "MultiModalDataset")) {
-        stop("datasets must be a MultiModalDataset object")
-    }
-
-    # Convert indices to integer vector if necessary
-    indices <- as.integer(indices)
+    if (is.null(datasets)) stop("Null datasets provided")
+    if (length(indices) == 0) stop("Empty indices provided")
+    if (!is.list(datasets)) stop("Datasets must be a list")
     
-    # Create new data list for subsetted dataset
-    subsetted_data <- list()
+    # Create a new list with the same names
+    result <- vector("list", length(datasets))
+    names(result) <- names(datasets)
     
-    # First, copy all feature names
-    for (modality in names(datasets$features)) {
-        feature_name <- paste0(modality, "_features")
-        # Ensure features are character vectors
-        subsetted_data[[feature_name]] <- as.character(datasets$features[[modality]])
-    }
-    
-    # Process each data modality
-    modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
-    
-    # Debug info before processing
-    cat("Processing dataset subsetting:\n")
-    cat(sprintf("Original dataset size: %d samples\n", datasets$n_samples))
-    cat(sprintf("Subsetting to %d samples\n", length(indices)))
-    
-    for (modality in modalities) {
-        if (!is.null(datasets$data[[modality]])) {
-            tryCatch({
-                # Get original tensor
-                original_tensor <- datasets$data[[modality]]
-                
-                if (!inherits(original_tensor, "torch_tensor")) {
-                    stop(sprintf("Data for modality %s is not a torch tensor", modality))
-                }
-                
-                # Create subset using indexing
-                subsetted_tensor <- original_tensor[indices,]
-                
-                # Store subsetted tensor
-                subsetted_data[[modality]] <- subsetted_tensor
-                
-                # Handle corresponding mask if it exists
-                mask_name <- paste0(modality, "_mask")
-                if (!is.null(datasets$data[[mask_name]])) {
-                    mask_tensor <- datasets$data[[mask_name]]
-                    subsetted_mask <- mask_tensor[indices,]
-                    subsetted_data[[mask_name]] <- subsetted_mask
-                }
-                
-                # Debug info
-                cat(sprintf("Processed %s: %s -> %s\n",
-                          modality,
-                          paste(dim(original_tensor), collapse="x"),
-                          paste(dim(subsetted_tensor), collapse="x")))
-                
-            }, error = function(e) {
-                warning(sprintf("Error processing modality %s: %s", modality, conditionMessage(e)))
-                return(NULL)
-            })
+    # Process each modality
+    for (modality in names(datasets)) {
+        data <- datasets[[modality]]
+        if (is.null(data)) {
+            result[[modality]] <- NULL
+            next
+        }
+        
+        # Check if it's a feature names list
+        if (grepl("_features$", modality)) {
+            result[[modality]] <- data  # Keep all feature names
+            next
+        }
+        
+        # For data and mask modalities
+        if (inherits(data, "torch_tensor")) {
+            # Convert indices to torch tensor for indexing
+            torch_indices <- torch_tensor(indices, dtype=torch_long())
+            
+            # Subset the tensor
+            result[[modality]] <- data[torch_indices,]
+        } else {
+            # For other data types (matrices, data frames)
+            result[[modality]] <- data[indices,]
         }
     }
     
-    # Validate subsetted data before creating new dataset
-    if (length(subsetted_data) == 0) {
-        stop("No data was successfully subsetted")
-    }
+    # Create a MultiModalDataset from the subsetted data
+    dataset <- MultiModalDataset(result)
     
-    # We'll use the same class as the input dataset
-    new_dataset <- datasets$clone()
-    
-    # Update the data
-    new_dataset$data <- subsetted_data
-    
-    # Update sample information
-    new_dataset$n_samples <- length(indices)
-    
-    # Update sample IDs if they exist
-    if (!is.null(datasets$unified_sample_ids)) {
-        new_dataset$unified_sample_ids <- datasets$unified_sample_ids[indices]
-    }
-    
-    if (!is.null(datasets$sample_ids)) {
-        new_dataset$sample_ids <- lapply(datasets$sample_ids, function(ids) {
-            if (!is.null(ids)) ids[indices]
-        })
-    }
-    
-    # Update sample ID to index mapping
-    if (!is.null(datasets$sample_id_to_index)) {
-        new_mapping <- list()
-        for (id in new_dataset$unified_sample_ids) {
-            new_mapping[[id]] <- which(new_dataset$unified_sample_ids == id)
-        }
-        new_dataset$sample_id_to_index <- new_mapping
-    }
-    
-    # Verify the new dataset
-    if (new_dataset$n_samples != length(indices)) {
-        warning(sprintf("Created dataset has %d samples, expected %d",
-                      new_dataset$n_samples, length(indices)))
-    }
-    
-    return(new_dataset)
+    return(dataset)
 }
 
 #' Run nested cross-validation
@@ -861,7 +782,6 @@ aggregate_cv_results <- function(results) {
 #' @param data Test data (MultiModalDataset)
 #' @param outcome_type Either "binary" or "survival"
 #' @return List of evaluation metrics and predictions
-
 evaluate_model <- function(model, data, outcome_type = "binary") {
     model$eval()
     loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE)
@@ -872,24 +792,16 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
     events <- list()
     attention_weights <- list()
     
-    # Get correct indices for clinical variables
-    if (outcome_type == "binary") {
-        target_idx <- which(data$features$clinical == "demographics_vital_status_alive")
-    } else {
-        time_idx <- which(data$features$clinical == "survival_time")
-        event_idx <- which(data$features$clinical == "event")
-    }
-    
     with_no_grad({
         coro::loop(for (batch in loader) {
             output <- model(batch$data, batch$masks)
             predictions[[length(predictions) + 1]] <- output$predictions$cpu()
             
             if (outcome_type == "binary") {
-                targets[[length(targets) + 1]] <- batch$data$clinical[,target_idx]$cpu()
+                targets[[length(targets) + 1]] <- batch$target$cpu()
             } else {
-                times[[length(times) + 1]] <- batch$data$clinical[,time_idx]$cpu()
-                events[[length(events) + 1]] <- batch$data$clinical[,event_idx]$cpu()
+                times[[length(times) + 1]] <- batch$time$cpu()
+                events[[length(events) + 1]] <- batch$event$cpu()
             }
             
             if (!is.null(output$attention_weights)) {
@@ -897,7 +809,7 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
             }
         })
     })
-
+    
     # Concatenate results
     all_predictions <- torch_cat(predictions, dim = 1)
     
@@ -1343,36 +1255,55 @@ validate_cv_splits <- function(cv_splits) {
 #' @param datasets MultiModalDataset or list of data files
 #' @param cancer_type Cancer type identifier
 #' @return TRUE if validation passes, stops with error if issues found
-
 validate_sample_consistency <- function(datasets, cancer_type) {
-    if (!inherits(datasets, "MultiModalDataset")) {
-        stop("datasets must be a MultiModalDataset object")
+    # Handle both MultiModalDataset and file path inputs
+    if (inherits(datasets, "MultiModalDataset")) {
+        # Get sample IDs from each modality
+        sample_ids <- lapply(datasets$data, function(x) {
+            if (inherits(x, "torch_tensor")) {
+                # Assuming first column is sample ID
+                as.character(x[,1]$cpu())
+            } else {
+                NULL
+            }
+        })
+
+        # Remove NULL entries and feature name lists
+        sample_ids <- sample_ids[!sapply(sample_ids, is.null)]
+        sample_ids <- sample_ids[!grepl("_features$", names(sample_ids))]
+
+    } else if (is.list(datasets) && all(sapply(datasets, is.character))) {
+        # Handle file path input
+        sample_ids <- lapply(datasets, function(file) {
+            if (file.exists(file)) {
+                df <- read.delim(file, nrows = 1)
+                if ("sample_id" %in% colnames(df) || "Sample_ID" %in% colnames(df)) {
+                    read.delim(file)[,1]
+                } else {
+                    NULL
+                }
+            } else {
+                NULL
+            }
+        })
+    } else {
+        stop("Invalid input type for datasets")
     }
 
-    # Get unique sample IDs for each modality
-    sample_ids <- datasets$get_sample_ids()
-
+    # Perform consistency checks
+    sample_ids <- sample_ids[!sapply(sample_ids, is.null)]
     if (length(sample_ids) == 0) {
-        stop("No sample IDs found in the dataset")
+        stop("No valid sample IDs found in any modality")
     }
 
-    # Check modality availability
-    modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
-    available_modalities <- names(datasets$data)[names(datasets$data) %in% modalities]
-
-    message(sprintf("Found %d samples across %d modalities in %s",
-                   length(sample_ids),
-                   length(available_modalities),
-                   cancer_type))
-
-    for (modality in available_modalities) {
-        n_available <- sum(!is.nan(datasets$data[[modality]][,1]$cpu()$numpy()))
-        message(sprintf("- %s: %d samples (%.1f%%)",
-                       modality,
-                       n_available,
-                       100 * n_available / length(sample_ids)))
+    # Check for consistency across modalities
+    reference_samples <- sample_ids[[1]]
+    for (modality in names(sample_ids)[-1]) {
+        if (!identical(sort(reference_samples), sort(sample_ids[[modality]]))) {
+            stop(sprintf("Sample mismatch in %s modality for %s",
+                        modality, cancer_type))
+        }
     }
 
     return(TRUE)
 }
-
