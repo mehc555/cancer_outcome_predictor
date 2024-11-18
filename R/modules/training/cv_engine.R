@@ -12,7 +12,7 @@ library(glmnet)
 #' @param datasets Torch MultiModalDataset or list
 #' @param outcome_type Either "binary" or "survival"
 #' @return Vector for stratification
-get_stratification_vector <- function(datasets, outcome_type = "binary") {
+get_stratification_vector <- function(datasets, outcome_type = "binary", outcome_var=NULL) {
     # Handle both MultiModalDataset and list inputs
     if (inherits(datasets, "MultiModalDataset")) {
         clinical_data <- as.matrix(datasets$data$clinical$cpu())
@@ -23,7 +23,7 @@ get_stratification_vector <- function(datasets, outcome_type = "binary") {
     }
     
     if (outcome_type == "binary") {
-        event_col <- which(clinical_features == "demographics_vital_status_alive")
+        event_col <- which(clinical_features == outcome_var)
         if (length(event_col) > 0) {
             return(clinical_data[, event_col])
         }
@@ -45,7 +45,7 @@ get_stratification_vector <- function(datasets, outcome_type = "binary") {
 #' @param config Training configuration
 #' @param outcome_type Either "binary" or "survival"
 #' @return Trained model, training history, and selected features
-train_model <- function(model, train_data, val_data, config, outcome_type = "binary") {
+train_model <- function(model, train_data, val_data, config, outcome_type = "binary", outcome_var=NULL) {
   # Perform feature selection on training data
   message("Performing feature selection on training data...")
   selected_features <- select_multimodal_features(
@@ -57,7 +57,8 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       mutations = config$model$architecture$modality_dims$mutations,
       methylation = config$model$architecture$modality_dims$methylation,
       mirna = config$model$architecture$modality_dims$mirna
-    )
+    ),
+    outcome_var=outcome_var
   )
   
   # Apply feature selection to both training and validation data
@@ -68,7 +69,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
   # Update model architecture based on new feature dimensions
   message("Updating model architecture for selected features...")
   modality_dims <- sapply(selected_features, length)
-  model$update_dimensions(modality_dims)
+  #model$update_dimensions(modality_dims)
   
   # Create data loaders with selected features
   train_loader <- dataloader(
@@ -634,7 +635,7 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
 run_nested_cv <- function(model, datasets, config, cancer_type, 
                          outcome_type = "binary",
                          validation_pct = 0.1, test_pct = 0.2, 
-                         seed = NULL, max_workers = 2, batch_size = 32) {
+                         seed = NULL, max_workers = 2, batch_size = 32, outcome_var=) {
     
     
     # Clear memory and set up parallel processing
@@ -659,7 +660,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 
 
     # Get stratification vector
-    stratify <- get_stratification_vector(datasets, outcome_type)
+    stratify <- get_stratification_vector(datasets, outcome_type, outcome_var)
     
     # Get total number of samples
     n_samples <- datasets$n_samples

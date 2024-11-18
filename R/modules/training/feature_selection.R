@@ -9,14 +9,15 @@ library(tidyr)
 #' @return List of selected feature names for each modality
 
 select_multimodal_features <- function(data, n_features = list(
-    cnv = 512,
-    clinical = 64,
-    expression = 512,
-    mutations = 64,
-    methylation = 512,
-    mirna = 512
-)) {
-    selected_features <- list()
+ cnv = config$model$architecture$modality_dims$cnv,
+      clinical = config$model$architecture$modality_dims$clinical,
+      expression = config$model$architecture$modality_dims$expression,
+      mutations = config$model$architecture$modality_dims$mutations,
+      methylation = config$model$architecture$modality_dims$methylation,
+      mirna = config$model$architecture$modality_dims$mirna
+      ), outcome_var=NULL) {
+    
+   selected_features <- list()
     
     # Process each modality
     for (modality in names(data)) {
@@ -47,7 +48,7 @@ select_multimodal_features <- function(data, n_features = list(
         selected_features[[modality]] <- switch(
             modality,
             cnv = select_cnv_features(mat, n_features$cnv),
-            clinical = select_clinical_features(mat, n_features$clinical),
+            clinical = select_clinical_features(mat, n_features$clinical, outcome_var=outcome_var),
             expression = select_variable_features(mat, n_features$expression, "expression"),
             mutations = select_mutation_features(mat, n_features$mutations),
             methylation = select_variable_features(mat, n_features$methylation, "methylation"),
@@ -92,7 +93,13 @@ select_cnv_features <- function(mat, n_features) {
 #' @param mat Matrix of clinical data
 #' @param n_features Number of features to select
 #' @return Vector of selected feature names
-select_clinical_features <- function(mat, n_features) {
+
+select_clinical_features <- function(mat, n_features, outcome_var = NULL) {
+    # Remove outcome variable if it exists
+    if (!is.null(outcome_var) && outcome_var %in% colnames(mat)) {
+        mat <- mat[, !colnames(mat) %in% outcome_var, drop = FALSE]
+    }
+    
     # Calculate variance for numeric columns and frequency for categorical
     feature_scores <- apply(mat, 2, function(x) {
         if (all(x %in% c(0, 1))) {
@@ -153,8 +160,9 @@ select_mutation_features <- function(mat, n_features) {
 #' @param dataset MultiModalDataset object
 #' @param selected_features List of selected feature names for each modality
 #' @return Updated MultiModalDataset with only selected features
+
 apply_feature_selection <- function(dataset, selected_features) {
-    # Create new data list
+    # Create new data list with same structure as original
     new_data <- list()
     
     # Process each modality
@@ -165,28 +173,66 @@ apply_feature_selection <- function(dataset, selected_features) {
         feature_indices <- match(selected_features[[modality]], 
                                dataset$features[[modality]])
         
+        # Ensure feature indices are valid
+        feature_indices <- feature_indices[!is.na(feature_indices)]
+        
+        # Use 1-based indexing for torch in R
+        torch_indices <- torch_tensor(feature_indices, dtype = torch_long())
+        
         # Select features from data tensor
         new_data[[modality]] <- torch_index_select(
             dataset$data[[modality]],
             dim = 2,
-            index = torch_tensor(feature_indices - 1, dtype = torch_long())
+            index = torch_indices
         )
         
-        # Update feature names
+        # Add feature names
         new_data[[paste0(modality, "_features")]] <- selected_features[[modality]]
         
-        # Update masks if they exist
+        # Copy mask if it exists
         mask_name <- paste0(modality, "_mask")
         if (!is.null(dataset$data[[mask_name]])) {
             new_data[[mask_name]] <- torch_index_select(
                 dataset$data[[mask_name]],
                 dim = 2,
-                index = torch_tensor(feature_indices - 1, dtype = torch_long())
+                index = torch_indices
             )
         }
     }
     
-    # Create new dataset
-    new_dataset <- MultiModalDataset$new(new_data)
+    # Add sample IDs as first column for each modality
+    for (modality in names(selected_features)) {
+        if (!is.null(new_data[[modality]])) {
+            # Convert sample IDs to tensor and combine
+            sample_ids_tensor <- torch_tensor(
+                matrix(1:dataset$n_samples, ncol=1),
+                dtype=torch_float32()
+            )
+            new_data[[modality]] <- torch_cat(
+                list(sample_ids_tensor, new_data[[modality]]),
+                dim=2
+            )
+        }
+    }
+    
+    # Create new dataset using the dataset constructor
+    new_dataset <- dataset(
+        name = "MultiModalDataset",
+        initialize = function() {
+            self$data <- new_data
+            self$features <- dataset$features
+            self$n_samples <- dataset$n_samples
+            self$sample_ids <- dataset$sample_ids
+            self$unified_sample_ids <- dataset$unified_sample_ids
+            self$sample_id_to_index <- dataset$sample_id_to_index
+        },
+        .getitem = dataset$.getitem,
+        .length = function() self$n_samples,
+        get_feature_names = dataset$get_feature_names,
+        get_sample_ids = dataset$get_sample_ids
+    )()
+    
     return(new_dataset)
 }
+
+

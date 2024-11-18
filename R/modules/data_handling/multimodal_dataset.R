@@ -99,7 +99,20 @@ MultiModalDataset <- dataset(
     }
   },
   
-  .getitem = function(index) {
+    .getitem = function(index) {
+    # Debug prints
+    cat("Index:", index, "\n")
+    cat("Sample ID:", self$unified_sample_ids[index], "\n")
+    
+    # Print tensor info for each modality
+    for (modality in names(self$data)) {
+        if (!grepl("_features$|_mask$", modality)) {
+            cat("\nModality:", modality, "\n")
+            cat("Tensor shape:", paste(self$data[[modality]]$size(), collapse="x"), "\n")
+            cat("Tensor type:", self$data[[modality]]$dtype, "\n")
+        }
+    }
+
     # Get sample ID for this index
     sample_id <- self$unified_sample_ids[index]
     
