@@ -95,7 +95,8 @@ SelfAttention <- nn_module(
   }
 )
 
-#' Enhanced modality encoder with self-attention and MLP
+#'Enhanced modality encoder with self-attention and MLP
+
 EnhancedModalityEncoder <- nn_module(
   "EnhancedModalityEncoder",
   initialize = function(input_dim, hidden_dims, num_heads = 4, dropout = 0.1) {
@@ -384,18 +385,51 @@ MultiModalSurvivalModel <- nn_module(
   },
 
    create_copy = function() {
-    # Create new model instance with same parameters
-    new_model <- MultiModalSurvivalModel(
-      modality_dims = self$modality_dims,
-      encoder_dims = self$encoder_dims,
-      fusion_dim = self$fusion_dim,
-      num_heads = self$num_heads,
-      dropout = self$dropout
-    )
+    # Create new model with same architecture
+    new_model <- torch::nn_module(
+        "MultiModalSurvivalModel",
+        initialize = function() {
+            self$modality_dims <- self$modality_dims
+            self$encoder_dims <- self$encoder_dims
+            self$fusion_dim <- self$fusion_dim
+            self$num_heads <- self$num_heads
+            self$dropout <- self$dropout
+            
+            # Initialize encoders
+            encoders_dict <- list()
+            for (name in names(self$modality_dims)) {
+                encoders_dict[[name]] <- EnhancedModalityEncoder(
+                    input_dim = self$modality_dims[[name]],
+                    hidden_dims = self$encoder_dims[[name]],
+                    num_heads = self$num_heads,
+                    dropout = self$dropout
+                )
+            }
+            self$encoders <- nn_module_dict(encoders_dict)
+            
+            # Initialize fusion
+            final_encoder_dims <- sapply(self$encoder_dims, function(x) x[length(x)])
+            self$fusion <- ModalityFusion(
+                modality_dims = final_encoder_dims,
+                fusion_dim = self$fusion_dim,
+                num_heads = self$num_heads,
+                dropout = self$dropout
+            )
+            
+            # Initialize prediction head
+            self$prediction_head <- nn_sequential(
+                nn_linear(self$fusion_dim, self$fusion_dim %/% 2),
+                nn_relu(),
+                nn_dropout(self$dropout),
+                nn_linear(self$fusion_dim %/% 2, 1)
+            )
+        }
+    )()
     
-    # Copy the state dict
+    # Copy the state dict to the new model
     new_model$load_state_dict(self$state_dict())
     
     return(new_model)
-  }
+ }
+
 )

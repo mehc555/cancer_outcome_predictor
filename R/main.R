@@ -2,9 +2,6 @@
 
 # Source base setup
 source("R/setup.R")
-source("R/modules/models/torch_models.R")
-source("R/modules/training/cv_engine.R")
-#source("R/modules/training/train_utils.R")
 
 # Source required modules
 source("R/modules/data_handling/download_processor.R")
@@ -16,7 +13,9 @@ source("R/modules/data_handling/methylation_processor.R")
 source("R/modules/data_handling/mirna_processor.R")
 source("R/modules/data_handling/multimodal_dataset.R")
 source("R/modules/helper_functions/misc.R")
-
+source("R/modules/models/torch_models.R")
+source("R/modules/training/cv_engine.R")
+source("R/modules/training/feature_selection.R")
 set.seed(123)
 
 
@@ -29,10 +28,11 @@ main <- function(download=FALSE) {
     
     # Download data
     if(!download) {
-    	download_tcga_data()
+    	#download_tcga_data()
     }
     # Define cancer types
-    cancer_types <- c("BRCA", "COAD", "LUAD")
+    #cancer_types <- c("BRCA", "COAD", "LUAD")
+    cancer_types <- c("BRCA")
     base_dir <- "data/GDC_TCGA"
     
     # Process data for each cancer type
@@ -121,7 +121,7 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
-	max_workers = 6,      # Limit parallel workers
+	max_workers = 2,      # Limit parallel workers
         batch_size = 32,
 	seed = NULL # using seed defined at the top for now
 	)
@@ -142,5 +142,5 @@ main <- function(download=FALSE) {
     return(processed_data)
 }
 
-main(download=FALSE)
+main()
 

@@ -6,6 +6,8 @@ library(progressr)
 library(survival)
 library(glmnet)
 
+
+
 #' Extract stratification variable from datasets
 #' @param datasets Torch MultiModalDataset or list
 #' @param outcome_type Either "binary" or "survival"
@@ -36,57 +38,81 @@ get_stratification_vector <- function(datasets, outcome_type = "binary") {
 }
 
 
-#' Train model with multi-modal data
+#' Train model with multi-modal data and feature selection
 #' @param model Neural network model
 #' @param train_data Training data
 #' @param val_data Validation data
 #' @param config Training configuration
 #' @param outcome_type Either "binary" or "survival"
-#' @return Trained model and training history
+#' @return Trained model, training history, and selected features
 train_model <- function(model, train_data, val_data, config, outcome_type = "binary") {
-  # Create data loaders
+  # Perform feature selection on training data
+  message("Performing feature selection on training data...")
+  selected_features <- select_multimodal_features(
+    train_data$data,
+    n_features = list(
+      cnv = config$model$architecture$modality_dims$cnv,
+      clinical = config$model$architecture$modality_dims$clinical,
+      expression = config$model$architecture$modality_dims$expression,
+      mutations = config$model$architecture$modality_dims$mutations,
+      methylation = config$model$architecture$modality_dims$methylation,
+      mirna = config$model$architecture$modality_dims$mirna
+    )
+  )
+  
+  # Apply feature selection to both training and validation data
+  message("Applying selected features to datasets...")
+  train_data_selected <- apply_feature_selection(train_data, selected_features)
+  val_data_selected <- apply_feature_selection(val_data, selected_features)
+  
+  # Update model architecture based on new feature dimensions
+  message("Updating model architecture for selected features...")
+  modality_dims <- sapply(selected_features, length)
+  model$update_dimensions(modality_dims)
+  
+  # Create data loaders with selected features
   train_loader <- dataloader(
-    dataset = train_data,
+    dataset = train_data_selected,
     batch_size = config$model$batch_size,
     shuffle = TRUE
   )
-
+  
   val_loader <- dataloader(
-    dataset = val_data,
+    dataset = val_data_selected,
     batch_size = config$model$batch_size,
     shuffle = FALSE
   )
-
+  
   # Initialize optimizer
   optimizer <- optim_adam(
     model$parameters,
     lr = config$model$optimizer$lr,
     weight_decay = config$model$optimizer$weight_decay
   )
-
+  
   # Initialize scheduler
   scheduler <- lr_reduce_on_plateau(
     optimizer,
     patience = config$model$scheduler$patience,
     factor = config$model$scheduler$factor
   )
-
+  
   # Initialize tracking variables
   best_val_loss <- Inf
   patience_counter <- 0
   best_model_state <- model$state_dict()
   training_history <- list()
-
+  
   # Training loop
   for (epoch in 1:config$model$max_epochs) {
     # Training phase
     model$train()
     train_losses <- c()
     train_metrics <- list()
-
+    
     coro::loop(for (batch in train_loader) {
       optimizer$zero_grad()
-
+      
       # Forward pass
       output <- model(batch$data, batch$masks)
       
@@ -94,17 +120,16 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       if (outcome_type == "binary") {
         loss <- nn_bce_with_logits_loss()(output$predictions, batch$target)
       } else if (outcome_type == "survival") {
-        # Cox partial likelihood loss
         loss <- compute_cox_loss(output$predictions, batch$time, batch$event)
       }
-
+      
       # Backward pass and optimization
       loss$backward()
       optimizer$step()
-
+      
       # Record loss
       train_losses <- c(train_losses, loss$item())
-
+      
       # Calculate additional metrics
       if (outcome_type == "binary") {
         batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
@@ -120,12 +145,12 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         train_metrics[[metric_name]] <- c(train_metrics[[metric_name]], batch_metrics[[metric_name]])
       }
     })
-
+    
     # Validation phase
     model$eval()
     val_losses <- c()
     val_metrics <- list()
-
+    
     with_no_grad({
       coro::loop(for (batch in val_loader) {
         output <- model(batch$data, batch$masks)
@@ -138,7 +163,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         }
         
         val_losses <- c(val_losses, loss$item())
-
+        
         # Calculate validation metrics
         if (outcome_type == "binary") {
           batch_metrics <- calculate_binary_metrics(output$predictions, batch$target)
@@ -155,7 +180,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         }
       })
     })
-
+    
     # Calculate epoch metrics
     epoch_metrics <- list(
       train_loss = mean(train_losses),
@@ -167,13 +192,13 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       epoch_metrics[[paste0("train_", metric_name)]] <- mean(train_metrics[[metric_name]])
       epoch_metrics[[paste0("val_", metric_name)]] <- mean(val_metrics[[metric_name]])
     }
-
+    
     # Store training history
     training_history[[epoch]] <- epoch_metrics
-
+    
     # Update scheduler
     scheduler$step(epoch_metrics$val_loss)
-
+    
     # Early stopping check
     if (epoch_metrics$val_loss < best_val_loss - config$model$early_stopping$min_delta) {
       best_val_loss <- epoch_metrics$val_loss
@@ -182,28 +207,30 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     } else {
       patience_counter <- patience_counter + 1
     }
-
+    
     # Print progress
     if (epoch %% config$model$print_every == 0) {
-      message(sprintf("Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f", 
-                     epoch, config$model$max_epochs, 
+      message(sprintf("Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f",
+                     epoch, config$model$max_epochs,
                      epoch_metrics$train_loss, epoch_metrics$val_loss))
     }
-
+    
     # Early stopping
     if (patience_counter >= config$model$early_stopping$patience) {
       message(sprintf("Early stopping triggered at epoch %d", epoch))
       break
     }
   }
-
+  
   # Load best model state
   model$load_state_dict(best_model_state)
-
+  
+  # Return model, history, and feature selection info
   return(list(
     model = model,
     history = training_history,
-    best_val_loss = best_val_loss
+    best_val_loss = best_val_loss,
+    selected_features = selected_features  # Include selected features in return
   ))
 }
 
@@ -521,57 +548,75 @@ create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct =
 }
 
 
-#' Memory-efficient dataset subsetting
-#' @param datasets List of datasets
+#' Memory-efficient dataset subsetting with proper tensor and feature handling
+#' @param datasets MultiModalDataset object
 #' @param indices Indices to subset
 #' @param batch_size Batch size for data loading
-#' @return Subsetted datasets
+#' @return Subsetted MultiModalDataset
 
-#' Memory-efficient dataset subsetting
-#' @param datasets List of datasets
-#' @param indices Indices to subset
-#' @param batch_size Batch size for data loading
-#' @return Subsetted torch dataset
 subset_datasets <- function(datasets, indices, batch_size = 32) {
-    if (is.null(datasets)) stop("Null datasets provided")
-    if (length(indices) == 0) stop("Empty indices provided")
-    if (!is.list(datasets)) stop("Datasets must be a list")
+    cat("1. Starting dataset subsetting\n")
     
-    # Create a new list with the same names
-    result <- vector("list", length(datasets))
-    names(result) <- names(datasets)
+    if (!inherits(datasets, "MultiModalDataset")) {
+        stop("datasets must be a MultiModalDataset object")
+    }
+
+    # For R torch, we'll use 1-based indexing
+    torch_indices <- torch_tensor(indices, dtype = torch_long())
     
-    # Process each modality
-    for (modality in names(datasets)) {
-        data <- datasets[[modality]]
-        if (is.null(data)) {
-            result[[modality]] <- NULL
-            next
-        }
-        
-        # Check if it's a feature names list
-        if (grepl("_features$", modality)) {
-            result[[modality]] <- data  # Keep all feature names
-            next
-        }
-        
-        # For data and mask modalities
-        if (inherits(data, "torch_tensor")) {
-            # Convert indices to torch tensor for indexing
-            torch_indices <- torch_tensor(indices, dtype=torch_long())
-            
-            # Subset the tensor
-            result[[modality]] <- data[torch_indices,]
-        } else {
-            # For other data types (matrices, data frames)
-            result[[modality]] <- data[indices,]
-        }
+    cat("2. Creating new data list\n")
+    subsetted_data <- list()
+    
+    cat("3. Processing tensors\n")
+    # Process each modality and its mask
+    modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
+    for (name in modalities) {
+        tryCatch({
+            # Get original tensor
+            original_tensor <- datasets$data[[name]]
+            if (!is.null(original_tensor) && inherits(original_tensor, "torch_tensor")) {
+                subsetted_data[[name]] <- torch_index_select(
+                    original_tensor,
+                    dim = 1,
+                    index = torch_indices
+                )
+                
+                # Get mask
+                mask_name <- paste0(name, "_mask")
+                original_mask <- datasets$data[[mask_name]]
+                if (!is.null(original_mask)) {
+                    subsetted_data[[mask_name]] <- torch_index_select(
+                        original_mask,
+                        dim = 1,
+                        index = torch_indices
+                    )
+                }
+            }
+        }, error = function(e) {
+            cat(sprintf("Error processing %s: %s\n", name, e$message))
+        })
     }
     
-    # Create a MultiModalDataset from the subsetted data
-    dataset <- MultiModalDataset(result)
+    cat("4. Creating new dataset\n")
     
-    return(dataset)
+    # Create new dataset with all methods
+    new_dataset <- dataset(
+        name = "MultiModalDataset",
+        initialize = function() {
+            self$data <- subsetted_data
+            self$features <- datasets$features
+            self$n_samples <- length(indices)
+            self$sample_ids <- datasets$sample_ids
+            self$unified_sample_ids <- datasets$unified_sample_ids[indices]
+            self$sample_id_to_index <- datasets$sample_id_to_index
+        },
+        .getitem = datasets$.getitem,
+        .length = function() self$n_samples,
+        get_feature_names = datasets$get_feature_names,
+        get_sample_ids = datasets$get_sample_ids
+    )()
+    
+    return(new_dataset)
 }
 
 #' Run nested cross-validation
@@ -591,6 +636,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                          validation_pct = 0.1, test_pct = 0.2, 
                          seed = NULL, max_workers = 2, batch_size = 32) {
     
+    
     # Clear memory and set up parallel processing
     gc()
     options(future.globals.maxSize = 2000 * 1024^2)
@@ -600,6 +646,18 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     actual_workers <- max(1, min(max_workers, floor(available_memory / 1)))
     message(sprintf("Using %d workers based on available memory", actual_workers))
     
+    # Verify initial dataset
+    message("\nVerifying initial dataset:")
+    message(sprintf("- Total samples: %d", datasets$n_samples))
+    message(sprintf("- Modalities: %s", paste(names(datasets$features), collapse=", ")))
+    
+    # Run a quick subset test
+    test_subset <- try(subset_datasets(datasets, 1:5))
+    if (inherits(test_subset, "try-error")) {
+        stop("Dataset subsetting test failed. Cannot proceed with CV.")
+    }
+
+
     # Get stratification vector
     stratify <- get_stratification_vector(datasets, outcome_type)
     
@@ -617,7 +675,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         stratify = stratify,
         seed = seed
     )
- 
+    
     # Validate splits
     validation_results <- validate_cv_splits(cv_splits)
     
@@ -628,17 +686,21 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                        validation_results$summary$overlap_percentage,
                        validation_results$summary$max_overlap_percentage))
     }
-
+    
     # Set up parallel processing
     plan(multisession, workers = actual_workers)
     
-    # Process each repeat
+    # Initialize results storage
     results <- vector("list", length(cv_splits))
+    fold_features <- list()  # Store selected features for each fold
     
-    for (repeat_idx in seq_along(cv_splits)) {
+    # Process each repeat
+    for (repeat_idx in 1) {
+    #for (repeat_idx in seq_along(cv_splits)) {
         message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
         
         repeat_split <- cv_splits[[repeat_idx]]
+        fold_features[[repeat_idx]] <- list()
         
         # Process outer folds in parallel
         outer_results <- future_lapply(seq_along(repeat_split$outer_splits), 
@@ -646,15 +708,21 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             model_copy <- model$create_copy()
             outer_split <- repeat_split$outer_splits[[fold_idx]]
             
+            # Initialize feature storage for this fold
+            fold_features[[repeat_idx]][[fold_idx]] <- list(
+                outer = NULL,
+                inner = list()
+            )
+            
             # Process inner folds
-            inner_results <- lapply(outer_split$inner_folds, function(inner_fold) {
+            inner_results <- lapply(seq_along(outer_split$inner_folds), function(inner_idx) {
                 inner_model <- model$create_copy()
                 
-                # Create datasets
-                inner_train_data <- subset_datasets(datasets, inner_fold$train_idx, batch_size)
-                inner_val_data <- subset_datasets(datasets, inner_fold$test_idx, batch_size)
+                # Create datasets for inner fold
+                inner_train_data <- subset_datasets(datasets, outer_split$inner_folds[[inner_idx]]$train_idx, batch_size)
+                inner_val_data <- subset_datasets(datasets, outer_split$inner_folds[[inner_idx]]$test_idx, batch_size)
                 
-                # Train and evaluate
+                # Train inner model with feature selection
                 trained_model <- train_model(
                     model = inner_model,
                     train_data = inner_train_data,
@@ -662,6 +730,9 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                     config = config,
                     outcome_type = outcome_type
                 )
+                
+                # Store selected features for this inner fold
+                fold_features[[repeat_idx]][[fold_idx]]$inner[[inner_idx]] <- trained_model$selected_features
                 
                 # Clean up
                 rm(inner_model, inner_train_data, inner_val_data)
@@ -682,12 +753,21 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                 outcome_type = outcome_type
             )
             
+            # Store selected features for outer fold
+            fold_features[[repeat_idx]][[fold_idx]]$outer <- final_model$selected_features
+            
             # Save intermediate results
             results_dir <- file.path(config$main$paths$results_dir, cancer_type)
+            if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+            
             saveRDS(
-                final_model,
-                file.path(results_dir, sprintf("repeat_%d_fold_%d_model.rds", 
-                                             repeat_idx, fold_idx))
+                list(
+                    model = final_model,
+                    features = fold_features[[repeat_idx]][[fold_idx]]
+                ),
+                file.path(results_dir, 
+                         sprintf("repeat_%d_fold_%d_results.rds", 
+                                repeat_idx, fold_idx))
             )
             
             # Clean up
@@ -707,7 +787,8 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             repeat_idx = repeat_idx,
             outer_results = outer_results,
             validation_results = validation_results,
-            best_model = best_model
+            best_model = best_model,
+            features = fold_features[[repeat_idx]]  # Store feature selection results
         )
         
         # Save results
@@ -716,20 +797,81 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             file.path(config$main$paths$results_dir, cancer_type,
                      sprintf("repeat_%d_results.rds", repeat_idx))
         )
+        
+        # Save feature selection summary
+        feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
+        saveRDS(
+            feature_summary,
+            file.path(config$main$paths$results_dir, cancer_type,
+                     sprintf("repeat_%d_feature_summary.rds", repeat_idx))
+        )
     }
     
     # Aggregate results
     final_results <- aggregate_cv_results(results)
     final_model <- select_final_model(results)
     
+    # Add feature analysis to final results
+    final_results$feature_analysis <- analyze_feature_selection(fold_features)
+    
     list(
         results = final_results,
         final_model = final_model,
         cv_splits = cv_splits,
         raw_results = results,
-        split_validation = validation_results
+        split_validation = validation_results,
+        fold_features = fold_features  # Include complete feature selection history
     )
+}
 
+#' Analyze feature selection patterns across folds
+#' @param fold_features Nested list of selected features
+#' @return Analysis of feature selection consistency
+analyze_feature_selection <- function(fold_features) {
+    # Initialize storage for feature counts
+    feature_counts <- list()
+    
+    # Process each modality separately
+    modalities <- c("cnv", "clinical", "expression", "mutations", "methylation", "mirna")
+    
+    for (modality in modalities) {
+        # Collect all features selected for this modality
+        all_features <- list()
+        
+        # Process outer folds
+        for (fold in fold_features) {
+            if (!is.null(fold$outer[[modality]])) {
+                all_features <- c(all_features, fold$outer[[modality]])
+            }
+            
+            # Process inner folds
+            for (inner in fold$inner) {
+                if (!is.null(inner[[modality]])) {
+                    all_features <- c(all_features, inner[[modality]])
+                }
+            }
+        }
+        
+        # Calculate feature frequencies
+        if (length(all_features) > 0) {
+            feature_counts[[modality]] <- sort(table(unlist(all_features)), decreasing = TRUE)
+        }
+    }
+    
+    # Calculate summary statistics
+    summary_stats <- lapply(feature_counts, function(counts) {
+        list(
+            n_unique_features = length(counts),
+            top_features = names(head(counts, 10)),
+            feature_frequencies = counts,
+            consistency_score = mean(counts) / max(counts)
+        )
+    })
+    
+    list(
+        feature_counts = feature_counts,
+        summary_stats = summary_stats
+    )
 }
 
 #' Select best model based on validation performance
