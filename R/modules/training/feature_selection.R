@@ -162,7 +162,6 @@ select_mutation_features <- function(mat, n_features) {
 #' @return Updated MultiModalDataset with only selected features
 
 apply_feature_selection <- function(dataset, selected_features) {
-    # Create new data list with same structure as original
     new_data <- list()
     
     # Process each modality
@@ -196,21 +195,6 @@ apply_feature_selection <- function(dataset, selected_features) {
                 dataset$data[[mask_name]],
                 dim = 2,
                 index = torch_indices
-            )
-        }
-    }
-    
-    # Add sample IDs as first column for each modality
-    for (modality in names(selected_features)) {
-        if (!is.null(new_data[[modality]])) {
-            # Convert sample IDs to tensor and combine
-            sample_ids_tensor <- torch_tensor(
-                matrix(1:dataset$n_samples, ncol=1),
-                dtype=torch_float32()
-            )
-            new_data[[modality]] <- torch_cat(
-                list(sample_ids_tensor, new_data[[modality]]),
-                dim=2
             )
         }
     }

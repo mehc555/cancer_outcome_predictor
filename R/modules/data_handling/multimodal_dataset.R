@@ -99,62 +99,33 @@ MultiModalDataset <- dataset(
     }
   },
   
-    .getitem = function(index) {
-    # Debug prints
-    cat("Index:", index, "\n")
-    cat("Sample ID:", self$unified_sample_ids[index], "\n")
-    
-    # Print tensor info for each modality
-    for (modality in names(self$data)) {
-        if (!grepl("_features$|_mask$", modality)) {
-            cat("\nModality:", modality, "\n")
-            cat("Tensor shape:", paste(self$data[[modality]]$size(), collapse="x"), "\n")
-            cat("Tensor type:", self$data[[modality]]$dtype, "\n")
-        }
-    }
-
-    # Get sample ID for this index
-    sample_id <- self$unified_sample_ids[index]
-    
-    # Initialize containers for batch data and masks
+   .getitem = function(index) {
     batch_data <- list()
     batch_masks <- list()
     
-    # Get modality names (excluding _features and _mask suffixes)
     modality_names <- unique(gsub("(_features|_mask)$", "", names(self$data)))
     
-    # Process each modality
     for (modality in modality_names) {
-      # Skip feature lists
-      if (grepl("_features$|_mask$", modality)) next
-      
-      # Get data tensor and mask
-      data_name <- modality
-      mask_name <- paste0(modality, "_mask")
-      
-      if (!is.null(self$data[[data_name]])) {
-        # Extract single sample
-        batch_data[[modality]] <- self$data[[data_name]][index,]
-        batch_masks[[modality]] <- self$data[[mask_name]][index,]
-      }
+        if (grepl("_features$|_mask$", modality)) next
+        
+        data_name <- modality
+        mask_name <- paste0(modality, "_mask")
+        
+        if (!is.null(self$data[[data_name]])) {
+            batch_data[[modality]] <- self$data[[data_name]][index,]
+            batch_masks[[modality]] <- self$data[[mask_name]][index,]
+        }
     }
     
-    # Get target variables from clinical data
-    target <- list(
-      time = self$data$clinical[index, which(self$features$clinical == "survival_time")],
-      event = self$data$clinical[index, which(self$features$clinical == "demographics_vital_status_alive")]
-    )
-    
     list(
-      sample_id = sample_id,
-      data = batch_data,
-      masks = batch_masks,
-      features = self$features,
-      time = target$time,
-      event = target$event
+        sample_id = self$unified_sample_ids[index],
+        data = batch_data,
+        masks = batch_masks,
+        features = self$features
     )
   },
-  
+
+
   .length = function() {
     self$n_samples
   },

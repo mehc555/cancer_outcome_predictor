@@ -124,7 +124,7 @@ main <- function(download=FALSE) {
 	max_workers = 2,      # Limit parallel workers
         batch_size = 32,
 	seed = NULL # using seed defined at the top for now
-	outcome_var = 
+	outcome_var = "demographics_vital_status_alive"
 	)
 
         # Save results
