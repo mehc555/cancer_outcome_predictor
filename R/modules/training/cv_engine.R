@@ -38,34 +38,180 @@ get_stratification_vector <- function(datasets, outcome_type = "binary", outcome
 }
 
 
-# Custom collate function
+# Updated custom collate function with feature preservation
 
 custom_collate <- function(batch) {
   data_tensors <- list()
   mask_tensors <- list()
-
+  outcome_tensors <- list()
+  
+  # Store features from the first batch item
+  features <- NULL
+  if (length(batch) > 0 && !is.null(batch[[1]]$features)) {
+    features <- batch[[1]]$features
+  }
+  
+  # Combine all modalities from the batch
   for (item in batch) {
+    # Handle data and masks as before
     for (modality in names(item$data)) {
       if (!modality %in% names(data_tensors)) {
         data_tensors[[modality]] <- list()
         mask_tensors[[modality]] <- list()
       }
-      data_tensors[[modality]][[length(data_tensors[[modality]]) + 1]] <- item$data[[modality]]
-      mask_tensors[[modality]][[length(mask_tensors[[modality]]) + 1]] <- item$masks[[modality]]
+      
+      if (is.data.frame(item$data[[modality]]) || is.matrix(item$data[[modality]])) {
+        tensor_data <- torch_tensor(
+          as.matrix(item$data[[modality]]), 
+          dtype = torch_float32()
+        )
+        data_tensors[[modality]][[length(data_tensors[[modality]]) + 1]] <- tensor_data
+        
+        mask <- torch_tensor(
+          !is.na(as.matrix(item$data[[modality]])),
+          dtype = torch_float32()
+        )
+        mask_tensors[[modality]][[length(mask_tensors[[modality]]) + 1]] <- mask
+      } else if (inherits(item$data[[modality]], "torch_tensor")) {
+        data_tensors[[modality]][[length(data_tensors[[modality]]) + 1]] <- item$data[[modality]]
+        if (!is.null(item$masks[[modality]])) {
+          mask_tensors[[modality]][[length(mask_tensors[[modality]]) + 1]] <- item$masks[[modality]]
+        }
+      }
+    }
+    
+    # Handle outcomes
+    if (!is.null(item$outcomes)) {
+      for (outcome_name in names(item$outcomes)) {
+        if (!outcome_name %in% names(outcome_tensors)) {
+          outcome_tensors[[outcome_name]] <- list()
+        }
+        outcome_tensors[[outcome_name]][[length(outcome_tensors[[outcome_name]]) + 1]] <- 
+          torch_tensor(item$outcomes[[outcome_name]], dtype = torch_float32())
+      }
     }
   }
-
+  
+  # Combine tensors
   collated <- list(
     data = list(),
-    masks = list()
+    masks = list(),
+    features = features,
+    outcomes = list()
   )
-
+  
+  # Stack data and mask tensors
   for (modality in names(data_tensors)) {
-    collated$data[[modality]] <- torch_stack(data_tensors[[modality]])
-    collated$masks[[modality]] <- torch_stack(mask_tensors[[modality]])
+    if (length(data_tensors[[modality]]) > 0) {
+      collated$data[[modality]] <- torch_stack(data_tensors[[modality]])$squeeze(2)
+      collated$masks[[modality]] <- torch_stack(mask_tensors[[modality]])$squeeze(2)
+      
+      # Replace NaN values with 0
+      collated$data[[modality]] <- torch_where(
+        torch_isnan(collated$data[[modality]]),
+        torch_zeros_like(collated$data[[modality]]),
+        collated$data[[modality]]
+      )
+    }
   }
-
+  
+  # Stack outcome tensors
+  for (outcome_name in names(outcome_tensors)) {
+    if (length(outcome_tensors[[outcome_name]]) > 0) {
+      collated$outcomes[[outcome_name]] <- torch_stack(outcome_tensors[[outcome_name]])
+    }
+  }
+  
+  # Add feature names
+  if (!is.null(features)) {
+    for (modality in names(features)) {
+      feature_name <- paste0(modality, "_features")
+      collated[[feature_name]] <- features[[modality]]
+    }
+  }
+  
   return(collated)
+}
+
+
+# Updated inspect batch function to also show features
+inspect_batch <- function(batch, verbose = TRUE) {
+  if (verbose) cat("\n=== Inspecting Batch Structure ===\n")
+  
+  # Check basic batch structure
+  cat("\nBatch components:", paste(names(batch), collapse=", "), "\n")
+  
+  # Inspect data tensors
+  if (!is.null(batch$data)) {
+    cat("\nData modalities:", paste(names(batch$data), collapse=", "), "\n")
+    for (modality in names(batch$data)) {
+      if (inherits(batch$data[[modality]], "torch_tensor")) {
+        cat(sprintf("\n%s tensor shape: %s", 
+                   modality, 
+                   paste(batch$data[[modality]]$size(), collapse=" x ")))
+        cat(sprintf("\n%s tensor type: %s", 
+                   modality, 
+                   batch$data[[modality]]$dtype))
+        
+        # Show first few feature names if available
+        feature_name <- paste0(modality, "_features")
+        if (!is.null(batch[[feature_name]])) {
+          cat(sprintf("\n%s first features: %s", 
+                     modality,
+                     paste(head(batch[[feature_name]], 3), collapse=", ")))
+        }
+      } else {
+        cat(sprintf("\nWarning: %s is not a tensor! Class: %s", 
+                   modality, 
+                   class(batch$data[[modality]])))
+      }
+    }
+  }
+  
+  # Inspect masks
+  if (!is.null(batch$masks)) {
+    cat("\n\nMask modalities:", paste(names(batch$masks), collapse=", "), "\n")
+    for (modality in names(batch$masks)) {
+      if (inherits(batch$masks[[modality]], "torch_tensor")) {
+        cat(sprintf("\n%s mask shape: %s", 
+                   modality, 
+                   paste(batch$masks[[modality]]$size(), collapse=" x ")))
+      } else {
+        cat(sprintf("\nWarning: %s mask is not a tensor! Class: %s", 
+                   modality, 
+                   class(batch$masks[[modality]])))
+      }
+    }
+  }
+  
+  # Show available features if present
+  if (!is.null(batch$features)) {
+    cat("\n\nFeature information available for modalities:", 
+        paste(names(batch$features), collapse=", "))
+  }
+  
+  # Return TRUE if everything is tensors, FALSE otherwise
+  all_tensors <- TRUE
+  
+  # Check data tensors
+  if (!is.null(batch$data)) {
+    for (modality in names(batch$data)) {
+      if (!inherits(batch$data[[modality]], "torch_tensor")) {
+        all_tensors <- FALSE
+      }
+    }
+  }
+  
+  # Check masks
+  if (!is.null(batch$masks)) {
+    for (modality in names(batch$masks)) {
+      if (!inherits(batch$masks[[modality]], "torch_tensor")) {
+        all_tensors <- FALSE
+      }
+    }
+  }
+  
+  return(all_tensors)
 }
 
 #' Train model with multi-modal data and feature selection
@@ -75,28 +221,29 @@ custom_collate <- function(batch) {
 #' @param config Training configuration
 #' @param outcome_type Either "binary" or "survival"
 #' @return Trained model, training history, and selected features
+
 train_model <- function(model, train_data, val_data, config, outcome_type = "binary", outcome_var = NULL) {
-  # Perform feature selection on training data
+  
   message("Performing feature selection on training data...")
   selected_features <- select_multimodal_features(
     train_data$data,
     n_features = list(
-      cnv = config$model$architecture$modality_dims$cnv,
-      clinical = config$model$architecture$modality_dims$clinical,
-      expression = config$model$architecture$modality_dims$expression,
-      mutations = config$model$architecture$modality_dims$mutations,
-      methylation = config$model$architecture$modality_dims$methylation,
-      mirna = config$model$architecture$modality_dims$mirna
+        cnv = config$model$architecture$modality_dims$cnv,
+        clinical = config$model$architecture$modality_dims$clinical,
+        expression = config$model$architecture$modality_dims$expression,
+        mutations = config$model$architecture$modality_dims$mutations,
+        methylation = config$model$architecture$modality_dims$methylation,
+        mirna = config$model$architecture$modality_dims$mirna
     ),
-    outcome_var = outcome_var
+    outcome_info = list(
+        type = "binary",
+        var = "demographics_vital_status_alive"
+    )
   )
-  
-  # Apply feature selection to both training and validation data
-  message("Applying selected features to datasets...")
+
   train_data_selected <- apply_feature_selection(train_data, selected_features)
   val_data_selected <- apply_feature_selection(val_data, selected_features)
-  
-  # Create data loaders with selected features
+   
   train_loader <- dataloader(
     dataset = train_data_selected,
     batch_size = config$model$batch_size,
@@ -111,132 +258,106 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     collate_fn = custom_collate
   )
   
-  # Initialize optimizer
   optimizer <- optim_adam(
     model$parameters,
     lr = config$model$optimizer$lr,
     weight_decay = config$model$optimizer$weight_decay
   )
   
-  # Initialize scheduler
   scheduler <- lr_reduce_on_plateau(
     optimizer,
     patience = config$model$scheduler$patience,
     factor = config$model$scheduler$factor
   )
   
-  # Initialize tracking variables
   best_val_loss <- Inf
   patience_counter <- 0
   best_model_state <- model$state_dict()
   training_history <- list()
   
-  # Training loop
   message("Starting training...")
   for (epoch in 1:config$model$max_epochs) {
-    # Training phase
     model$train()
     train_losses <- c()
     train_metrics <- list()
     
+        #batch <- coro::collect(train_loader, 1)[[1]]
+	#cat("Batch data dimensions:\n")
+	#for (name in names(batch$data)) {
+  	#if (!is.null(batch$data[[name]])) {
+    	#cat(sprintf("%s: %s\n", name, paste(batch$data[[name]]$size(), collapse=" x ")))
+  	#}
+	#}
+ 
     coro::loop(for (batch in train_loader) {
-      optimizer$zero_grad()
-      
-      # Forward pass with error handling
-      tryCatch({
-        output <- model(batch$data, batch$masks)
-        
-        if (outcome_type == "binary") {
-          clinical_features <- train_data_selected$features$clinical
-          outcome_idx <- which(clinical_features == outcome_var)
-          
-          if (length(outcome_idx) == 0) {
-            stop(sprintf("Outcome variable '%s' not found in clinical features", outcome_var))
-          }
-          
-          # Extract and prepare target
-          target <- torch_index_select(
-            batch$data$clinical,
-            dim = 2,
-            index = torch_tensor(outcome_idx - 1, dtype = torch_long())
-          )$squeeze(2)
-          
-          # Convert target to float and proper shape
-          target <- target$to(dtype = torch_float())
-          target <- target$unsqueeze(2)
-          
-          # Calculate loss with mask
-          loss <- masked_bce_loss(
-            output$predictions,
-            target,
-            batch$masks$clinical
-          )
-          
-        } else if (outcome_type == "survival") {
-          clinical_features <- train_data_selected$features$clinical
-          time_idx <- which(clinical_features == time_var)
-          event_idx <- which(clinical_features == event_var)
-          
-          if (length(time_idx) == 0 || length(event_idx) == 0) {
-            stop("Time or event variables not found in clinical features")
-          }
-          
-          time <- torch_index_select(
-            batch$data$clinical,
-            dim = 2,
-            index = torch_tensor(time_idx - 1, dtype = torch_long())
-          )$squeeze(2)
-          
-          event <- torch_index_select(
-            batch$data$clinical,
-            dim = 2,
-            index = torch_tensor(event_idx - 1, dtype = torch_long())
-          )$squeeze(2)
-          
-          loss <- compute_cox_loss(output$predictions, time, event)
-        }
-        
-        # Backward pass if loss is valid
-        if (!is.nan(loss$item()) && !is.infinite(loss$item())) {
-          loss$backward()
-          optimizer$step()
-          train_losses <- c(train_losses, loss$item())
-          
-          # Calculate additional metrics
-          if (outcome_type == "binary") {
-            batch_metrics <- calculate_binary_metrics(
-              output$predictions, 
-              target,
-              batch$masks$clinical
-            )
-          } else {
-            batch_metrics <- calculate_survival_metrics(
-              output$predictions, 
-              time, 
-              event
-            )
-          }
-          
-          # Accumulate metrics
-          for (metric_name in names(batch_metrics)) {
-            if (is.null(train_metrics[[metric_name]])) {
-              train_metrics[[metric_name]] <- c()
-            }
-            train_metrics[[metric_name]] <- c(
-              train_metrics[[metric_name]], 
-              batch_metrics[[metric_name]]
-            )
-          }
-        } else {
-          warning("Skipping batch due to invalid loss value")
-        }
-        
-      }, error = function(e) {
-        warning(sprintf("Error in training batch: %s", e$message))
-      })
-    })
+  optimizer$zero_grad()
+  
+  tryCatch({
+    output <- model(batch$data, batch$masks)
     
-    # Validation phase
+    if (outcome_type == "binary") {
+      target <- batch$outcomes$binary
+      # Ensure target has same shape as predictions
+      target <- target$unsqueeze(2)
+      
+      loss <- masked_bce_loss(
+        output$predictions,
+        target,
+        batch$masks$clinical
+      )
+      
+    } else if (outcome_type == "survival") {
+      loss <- compute_cox_loss(
+        output$predictions,
+        batch$outcomes$time,
+        batch$outcomes$event
+      )
+    }
+
+    if (!is.nan(loss$item()) && !is.infinite(loss$item())) {
+      loss$backward()
+      optimizer$step()
+      train_losses <- c(train_losses, loss$item())
+      
+      if (outcome_type == "binary") {
+        batch_metrics <- calculate_binary_metrics(
+          output$predictions, 
+          target,
+          batch$masks$clinical
+        )
+      } else {
+        batch_metrics <- calculate_survival_metrics(
+          output$predictions, 
+          batch$outcomes$time, 
+          batch$outcomes$event
+        )
+      }
+      
+      for (metric_name in names(batch_metrics)) {
+        if (is.null(train_metrics[[metric_name]])) {
+          train_metrics[[metric_name]] <- c()
+        }
+        train_metrics[[metric_name]] <- c(
+          train_metrics[[metric_name]], 
+          batch_metrics[[metric_name]]
+        )
+      }
+    } else {
+      warning("Skipping batch due to invalid loss value")
+    }
+    
+  }, error = function(e) {
+    # Print more detailed error information for debugging
+    cat("Error details:\n")
+    cat("Batch structure:\n")
+    str(batch, max.level = 2)
+    cat("\nOutput structure:\n")
+    str(output, max.level = 2)
+    warning(sprintf("Error in training batch: %s", e$message))
+  })
+  })
+ 
+
     model$eval()
     val_losses <- c()
     val_metrics <- list()
@@ -244,7 +365,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     with_no_grad({
       coro::loop(for (batch in val_loader) {
         tryCatch({
-          output <- model(batch$data, batch$masks)
+          output <- model(batch$data)
           
           if (outcome_type == "binary") {
             target <- torch_index_select(
@@ -261,7 +382,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
               target,
               batch$masks$clinical
             )
-            
           } else if (outcome_type == "survival") {
             time <- torch_index_select(
               batch$data$clinical,
@@ -281,7 +401,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
           if (!is.nan(loss$item()) && !is.infinite(loss$item())) {
             val_losses <- c(val_losses, loss$item())
             
-            # Calculate validation metrics
             if (outcome_type == "binary") {
               batch_metrics <- calculate_binary_metrics(
                 output$predictions, 
@@ -296,7 +415,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
               )
             }
             
-            # Accumulate metrics
             for (metric_name in names(batch_metrics)) {
               if (is.null(val_metrics[[metric_name]])) {
                 val_metrics[[metric_name]] <- c()
@@ -314,26 +432,21 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       })
     })
     
-    # Calculate epoch metrics
     if (length(train_losses) > 0 && length(val_losses) > 0) {
       epoch_metrics <- list(
         train_loss = mean(train_losses),
         val_loss = mean(val_losses)
       )
       
-      # Add mean of accumulated metrics
       for (metric_name in names(train_metrics)) {
         epoch_metrics[[paste0("train_", metric_name)]] <- mean(train_metrics[[metric_name]])
         epoch_metrics[[paste0("val_", metric_name)]] <- mean(val_metrics[[metric_name]])
       }
       
-      # Store training history
       training_history[[epoch]] <- epoch_metrics
       
-      # Update scheduler
       scheduler$step(epoch_metrics$val_loss)
       
-      # Early stopping check
       if (epoch_metrics$val_loss < best_val_loss - config$model$early_stopping$min_delta) {
         best_val_loss <- epoch_metrics$val_loss
         best_model_state <- model$state_dict()
@@ -342,7 +455,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         patience_counter <- patience_counter + 1
       }
       
-      # Print progress
       if (epoch %% config$model$print_every == 0) {
         message(sprintf(
           "Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f",
@@ -351,7 +463,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         ))
       }
       
-      # Early stopping
       if (patience_counter >= config$model$early_stopping$patience) {
         message(sprintf("Early stopping triggered at epoch %d", epoch))
         break
@@ -361,10 +472,8 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     }
   }
   
-  # Load best model state
   model$load_state_dict(best_model_state)
   
-  # Return results
   list(
     model = model,
     history = training_history,
@@ -723,8 +832,7 @@ create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct =
     return(folds)
 }
 
-
-#' Memory-efficient dataset subsetting with proper tensor and feature handling
+#' Memory-efficient dataset subsetting with proper tensor and outcome handling
 #' @param datasets MultiModalDataset object
 #' @param indices Indices to subset
 #' @param batch_size Batch size for data loading
@@ -736,46 +844,44 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
     if (!inherits(datasets, "MultiModalDataset")) {
         stop("datasets must be a MultiModalDataset object")
     }
-
-    # For R torch, we'll use 1-based indexing
-    torch_indices <- torch_tensor(indices, dtype = torch_long())
     
     cat("2. Creating new data list\n")
     subsetted_data <- list()
     
-    cat("3. Processing tensors\n")
-    # Process each modality and its mask
+    cat("3. Processing data and masks for each modality\n")
     modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
-    for (name in modalities) {
-        tryCatch({
-            # Get original tensor
-            original_tensor <- datasets$data[[name]]
-            if (!is.null(original_tensor) && inherits(original_tensor, "torch_tensor")) {
-                subsetted_data[[name]] <- torch_index_select(
-                    original_tensor,
-                    dim = 1,
-                    index = torch_indices
-                )
+    for (modality in modalities) {
+        if (!is.null(datasets$data[[modality]])) {
+            cat(sprintf("   - Processing %s\n", modality))
+            
+            # Subset data
+            subsetted_data[[modality]] <- datasets$data[[modality]][indices, , drop = FALSE]
+            
+            # Subset corresponding mask
+            mask_name <- paste0(modality, "_mask")
+            if (!is.null(datasets$data[[mask_name]])) {
+                subsetted_data[[mask_name]] <- datasets$data[[mask_name]][indices, , drop = FALSE]
                 
-                # Get mask
-                mask_name <- paste0(name, "_mask")
-                original_mask <- datasets$data[[mask_name]]
-                if (!is.null(original_mask)) {
-                    subsetted_data[[mask_name]] <- torch_index_select(
-                        original_mask,
-                        dim = 1,
-                        index = torch_indices
-                    )
-                }
+                cat(sprintf("     Maintained mask with %.1f%% valid values\n",
+                          100 * mean(subsetted_data[[mask_name]], na.rm=TRUE)))
             }
-        }, error = function(e) {
-            cat(sprintf("Error processing %s: %s\n", name, e$message))
-        })
+        }
     }
     
-    cat("4. Creating new dataset\n")
+    cat("4. Processing outcomes if present\n")
+    # Handle outcomes
+    subsetted_outcomes <- NULL
+    if (!is.null(datasets$outcomes)) {
+        subsetted_outcomes <- list()
+        for (outcome_name in names(datasets$outcomes)) {
+            original_outcome <- datasets$outcomes[[outcome_name]]
+            if (!is.null(original_outcome)) {
+                subsetted_outcomes[[outcome_name]] <- original_outcome[indices]
+            }
+        }
+    }
     
-    # Create new dataset with all methods
+    cat("5. Creating new dataset\n")
     new_dataset <- dataset(
         name = "MultiModalDataset",
         initialize = function() {
@@ -785,8 +891,66 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
             self$sample_ids <- datasets$sample_ids
             self$unified_sample_ids <- datasets$unified_sample_ids[indices]
             self$sample_id_to_index <- datasets$sample_id_to_index
+            self$outcome_info <- datasets$outcome_info
+            self$outcomes <- subsetted_outcomes
         },
-        .getitem = datasets$.getitem,
+        .getitem = function(index) {
+            # Initialize lists for data and masks
+            data_list <- list()
+            masks_list <- list()
+            
+            # Get current sample ID
+            current_sample_id <- self$unified_sample_ids[index]
+            
+            # Process each modality
+            for (modality in names(self$data)) {
+                if (!grepl("_mask$", modality) && !is.null(self$data[[modality]])) {
+                    # Get data for current sample
+                    data_values <- as.matrix(self$data[[modality]][index, -1, drop = FALSE])
+                    
+                    # Convert to tensor
+                    data_list[[modality]] <- torch_tensor(
+                        data_values,
+                        dtype = torch_float32()
+                    )
+                    
+                    # Get corresponding mask
+                    mask_name <- paste0(modality, "_mask")
+                    if (!is.null(self$data[[mask_name]])) {
+                        masks_list[[modality]] <- torch_tensor(
+                            self$data[[mask_name]][index, , drop = FALSE],
+                            dtype = torch_float32()
+                        )
+                    } else {
+                        # Create mask from data if not stored
+                        masks_list[[modality]] <- torch_tensor(
+                            !is.na(data_values),
+                            dtype = torch_float32()
+                        )
+                    }
+                    
+                    # Replace NA values with 0 in data tensor
+                    data_list[[modality]][is.na(data_list[[modality]])] <- 0
+                }
+            }
+            
+            # Create batch
+            batch <- list(
+                sample_id = current_sample_id,
+                data = data_list,
+                masks = masks_list,
+                features = self$features
+            )
+            
+            # Add outcomes if they exist
+            if (!is.null(self$outcomes)) {
+                batch$outcomes <- lapply(self$outcomes, function(outcome) {
+                    outcome[index]
+                })
+            }
+            
+            return(batch)
+        },
         .length = function() self$n_samples,
         get_feature_names = datasets$get_feature_names,
         get_sample_ids = datasets$get_sample_ids
@@ -794,6 +958,7 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
     
     return(new_dataset)
 }
+
 
 #' Run nested cross-validation
 #' @param model Neural network model
@@ -1100,6 +1265,7 @@ aggregate_cv_results <- function(results) {
 #' @param data Test data (MultiModalDataset)
 #' @param outcome_type Either "binary" or "survival"
 #' @return List of evaluation metrics and predictions
+
 evaluate_model <- function(model, data, outcome_type = "binary") {
     model$eval()
     loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE)
@@ -1108,11 +1274,10 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
     targets <- list()
     times <- list()
     events <- list()
-    attention_weights <- list()
     
     with_no_grad({
         coro::loop(for (batch in loader) {
-            output <- model(batch$data, batch$masks)
+            output <- model(batch$data)
             predictions[[length(predictions) + 1]] <- output$predictions$cpu()
             
             if (outcome_type == "binary") {
@@ -1121,14 +1286,9 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
                 times[[length(times) + 1]] <- batch$time$cpu()
                 events[[length(events) + 1]] <- batch$event$cpu()
             }
-            
-            if (!is.null(output$attention_weights)) {
-                attention_weights[[length(attention_weights) + 1]] <- output$attention_weights
-            }
         })
     })
     
-    # Concatenate results
     all_predictions <- torch_cat(predictions, dim = 1)
     
     if (outcome_type == "binary") {
@@ -1153,155 +1313,7 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
         )
     }
     
-    # Add attention weights if available
-    if (length(attention_weights) > 0) {
-        results$attention_weights <- attention_weights
-    }
-    
     results
-}
-
-#' Analyze feature importance using integrated gradients
-#' @param model Trained model
-#' @param data Reference data (MultiModalDataset)
-#' @param n_steps Number of steps for path integral
-#' @return Feature importance scores
-analyze_feature_importance <- function(model, data, n_steps = 50) {
-    model$eval()
-    
-    # Handle MultiModalDataset input
-    if (inherits(data, "MultiModalDataset")) {
-        baseline <- lapply(data$data, function(x) {
-            if (inherits(x, "torch_tensor")) {
-                torch_zeros_like(x)
-            } else {
-                NULL
-            }
-        })
-        
-        # Remove feature name lists from baseline
-        baseline <- baseline[!grepl("_features$", names(baseline))]
-    } else {
-        baseline <- lapply(data, function(x) {
-            if (inherits(x, "torch_tensor")) {
-                torch_zeros_like(x)
-            } else {
-                NULL
-            }
-        })
-    }
-    
-    # Calculate integrated gradients
-    importance_scores <- list()
-    
-    with_no_grad({
-        for (modality in names(baseline)) {
-            if (!is.null(baseline[[modality]])) {
-                # Create path points
-                alphas <- seq(0, 1, length.out = n_steps)
-                gradients <- torch_zeros_like(data$data[[modality]])
-                
-                for (alpha in alphas) {
-                    # Interpolate between baseline and input
-                    interp_input <- baseline[[modality]] + 
-                        alpha * (data$data[[modality]] - baseline[[modality]])
-                    interp_input$requires_grad_(TRUE)
-                    
-                    # Forward pass
-                    output <- model(interp_input)
-                    
-                    # Calculate gradients
-                    grad <- torch_autograd_grad(
-                        output$predictions,
-                        interp_input,
-                        torch_ones_like(output$predictions)
-                    )[[1]]
-                    
-                    gradients <- gradients + grad
-                }
-                
-                # Calculate importance scores
-                importance <- (data$data[[modality]] - baseline[[modality]]) * 
-                    gradients / n_steps
-                
-                importance_scores[[modality]] <- importance$abs()$mean(dim = 1)
-            }
-        }
-    })
-    
-    importance_scores
-}
-
-#' Analyze attention patterns
-#' @param attention_weights List of attention weights
-#' @param feature_names List of feature names by modality (from MultiModalDataset)
-#' @return Analysis of attention patterns
-analyze_attention_patterns <- function(attention_weights, dataset) {
-    # Extract feature names from dataset
-    if (inherits(dataset, "MultiModalDataset")) {
-        feature_names <- lapply(names(dataset$data), function(name) {
-            if (grepl("_features$", name)) {
-                dataset$data[[name]]
-            }
-        })
-        names(feature_names) <- gsub("_features$", "", names(feature_names))
-    } else {
-        feature_names <- dataset  # Assume direct feature names passed
-    }
-    
-   if (!is.null(attention_weights$self_attention)) {
-        attention_analysis$self_attention <- lapply(names(attention_weights$self_attention), 
-                                                  function(modality) {
-            weights <- attention_weights$self_attention[[modality]]
-            
-            # Average attention weights across heads and batches
-            avg_weights <- torch_mean(weights, dim = c(1, 2))
-            
-            # Get top attended features
-            top <- torch_topk(avg_weights, k = 10)
-            top_values <- top[[1]]  # First element contains values
-            top_indices <- top[[2]]  # Second element contains indices
-            
-            # Match with feature names
-            top_features <- feature_names[[modality]][top_indices$cpu()$numpy()]
-            
-            list(
-                modality = modality,
-                top_features = top_features,
-                attention_scores = top_values$cpu()$numpy()
-            )
-        })
-    }
-    
-    # Analyze cross-attention patterns
-    if (!is.null(attention_weights$cross_attention)) {
-        # Average across heads and batches
-        avg_cross_attention <- torch_mean(attention_weights$cross_attention, 
-                                        dim = c(1, 2))
-        
-        # Get top cross-modal interactions
-        top <- torch_topk(avg_cross_attention$view(-1), k = 10)
-        top_values <- top[[1]]
-        top_indices <- top[[2]]
-        
-        # Convert linear indices to 2D indices
-        rows <- top_indices %/% avg_cross_attention$size(2)
-        cols <- top_indices %% avg_cross_attention$size(2)
-        
-        # Match with modality names
-        modality_names <- names(feature_names)
-        cross_modal_interactions <- lapply(1:length(top_values), function(i) {
-            list(
-                from_modality = modality_names[rows[i] + 1],
-                to_modality = modality_names[cols[i] + 1],
-                attention_score = top_values[i]$cpu()$numpy()
-            )
-        })
-        
-        attention_analysis$cross_attention <- cross_modal_interactions
-    }
-    
-    attention_analysis
 }
 
 
@@ -1390,28 +1402,19 @@ generate_performance_visualization <- function(results, outcome_type = "binary")
 #' @param cancer_type Cancer type
 #' @param config Configuration
 #' @param output_dir Output directory
+
 save_analysis_results <- function(results, cancer_type, config, output_dir) {
-    # Create output directory
     dir.create(file.path(output_dir, cancer_type), recursive = TRUE, 
               showWarnings = FALSE)
     
-    # Save model performance metrics
     saveRDS(results$results, 
             file.path(output_dir, cancer_type, "performance_metrics.rds"))
     
-    # Save feature importance analysis
     if (!is.null(results$feature_importance)) {
         saveRDS(results$feature_importance,
                 file.path(output_dir, cancer_type, "feature_importance.rds"))
     }
     
-    # Save attention analysis
-    if (!is.null(results$attention_analysis)) {
-        saveRDS(results$attention_analysis,
-                file.path(output_dir, cancer_type, "attention_analysis.rds"))
-    }
-    
-    # Save visualizations
     if (!is.null(results$plots)) {
         for (plot_name in names(results$plots)) {
             ggsave(
@@ -1424,10 +1427,8 @@ save_analysis_results <- function(results, cancer_type, config, output_dir) {
         }
     }
     
-    # Save configuration
     saveRDS(config, file.path(output_dir, cancer_type, "config.rds"))
     
-    # Generate and save summary report
     report <- generate_summary_report(results, cancer_type, config)
     writeLines(report, file.path(output_dir, cancer_type, "summary_report.txt"))
 }

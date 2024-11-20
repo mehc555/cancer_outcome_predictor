@@ -95,12 +95,24 @@ main <- function(download=FALSE) {
 		write.table(processed_data[[cancer_type]][[modality]], paste0(input_dir,"/",modality,".matrix.tsv"), quote=F, row.names=F, sep="\t")
 	}
 
+        # Outcome information
+
+        outcome_info <- list(
+ 	type = "binary",
+  	var = "demographics_vital_status_alive"
+  	# OR for survival:
+  	# type = "survival",
+  	# time_var = "demographics_days_to_death",
+  	# event_var = "demographics_vital_status"
+	)
+
 	# Convert to torch datasets
         message("\nConverting data to torch format...")
         
 	torch_datasets <- create_torch_datasets(
             processed_data[[cancer_type]], 
-            config$model
+            config$model,
+	    outcome_info = outcome_info
         )
 
 	# Initialize model
@@ -108,7 +120,6 @@ main <- function(download=FALSE) {
     	modality_dims = config$model$architecture$modality_dims,
     	encoder_dims = config$model$architecture$encoder_dims,
     	fusion_dim = config$model$architecture$fusion_dim,
-    	num_heads = config$model$architecture$num_heads,
     	dropout = config$model$architecture$dropout
 	)
 
@@ -123,7 +134,7 @@ main <- function(download=FALSE) {
 	test_pct = 0.3,
 	max_workers = 2,      # Limit parallel workers
         batch_size = 32,
-	seed = NULL # using seed defined at the top for now
+	seed = NULL, # using seed defined at the top for now
 	outcome_var = "demographics_vital_status_alive"
 	)
 

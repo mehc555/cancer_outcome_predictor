@@ -3,173 +3,197 @@ library(torch)
 MultiModalDataset <- dataset(
   name = "MultiModalDataset",
   
-  initialize = function(data) {
-    # Validate input data structure
-    required_prefixes <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
-    if (!all(sapply(required_prefixes, function(x) any(grepl(paste0("^", x), names(data)))))) {
-      stop("Missing required data modalities")
-    }
-    
-    # Store data
+  initialize = function(data, outcome_info = NULL) {
+    # Store initial data and setup
     self$data <- data
-    self$features <- list()  # Store feature names for each modality
-    self$sample_ids <- list()  # Store sample IDs for each modality
+    self$features <- list()
     
-    # First pass: collect all sample IDs and features
-    all_sample_ids <- list()
-    for (name in names(self$data)) {
-      if (!grepl("_features$|_mask$", name)) {
-        all_sample_ids[[name]] <- as.character(self$data[[name]][,1])
-        self$features[[name]] <- colnames(self$data[[name]])[-1]  # Exclude sample ID column
+    # Get reference samples from clinical data
+    if (is.null(data$clinical)) {
+      stop("Clinical data is required as the reference for sample alignment")
+    }
+    reference_samples <- as.character(data$clinical$sample_id)
+    self$n_samples <- length(reference_samples)
+    
+    cat(sprintf("\nAligning all modalities to %d clinical samples...\n", self$n_samples))
+    
+    # Store features for each modality
+    modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
+    
+    # Align and pad each modality using vectorized operations
+    for (modality in modalities) {
+      if (!is.null(self$data[[modality]])) {
+        # Store features
+        self$features[[modality]] <- colnames(self$data[[modality]])[-1]
+        
+        # Get current data and samples
+        current_data <- self$data[[modality]]
+        current_samples <- as.character(current_data$sample_id)
+        
+        # Create new data matrix with NAs
+        feature_cols <- self$features[[modality]]
+        aligned_data <- matrix(NA, 
+                             nrow = length(reference_samples), 
+                             ncol = length(feature_cols))
+        colnames(aligned_data) <- feature_cols
+        
+        # Find matching indices in one go
+        match_idx <- match(reference_samples, current_samples)
+        
+        # Fill data in one operation
+        valid_idx <- !is.na(match_idx)
+        if (any(valid_idx)) {
+          aligned_data[valid_idx,] <- as.matrix(current_data[match_idx[valid_idx], feature_cols])
+        }
+        
+        # Create new dataframe with aligned data
+        self$data[[modality]] <- data.frame(
+          sample_id = reference_samples,
+          aligned_data,
+          stringsAsFactors = FALSE,
+          check.names = FALSE
+        )
+        
+        # Print alignment summary
+        n_complete <- sum(complete.cases(aligned_data))
+        cat(sprintf("- %s: %d/%d complete samples (%.1f%%)\n", 
+                   modality, n_complete, self$n_samples, 
+                   100 * n_complete/self$n_samples))
       }
     }
     
-    # Create unified sample ID list
-    self$unified_sample_ids <- unique(unlist(all_sample_ids))
-    self$n_samples <- length(self$unified_sample_ids)
+    # Create sample index mapping
+    self$sample_id_to_index <- setNames(seq_along(reference_samples), reference_samples)
     
-    # Create sample ID to index mapping
-    self$sample_id_to_index <- setNames(seq_along(self$unified_sample_ids), self$unified_sample_ids)
-    
-    # Second pass: convert data to tensors with proper alignment
-    for (name in names(self$data)) {
-      # Skip feature names and masks
-      if (grepl("_features$|_mask$", name)) {
-        next
-      }
-      
-      if (!inherits(self$data[[name]], "torch_tensor")) {
-        tryCatch({
-          # Get current modality's sample IDs
-          current_sample_ids <- as.character(self$data[[name]][,1])
-          self$sample_ids[[name]] <- current_sample_ids
-          
-          # Create data matrix
-          mat_data <- as.matrix(self$data[[name]][,-1])  # Remove first column
-          
-          # Handle different data types
-          if (!is.numeric(mat_data)) {
-            mat_data <- apply(mat_data, 2, function(x) {
-              if (is.character(x) || is.factor(x)) {
-                as.numeric(as.factor(x)) - 1
-              } else {
-                as.numeric(x)
-              }
-            })
-          }
-          
-          # Create full-size matrix with NaN for missing samples
-          n_features <- ncol(mat_data)
-          full_mat <- matrix(NaN, nrow=self$n_samples, ncol=n_features)
-          
-          # Fill in available data
-          sample_indices <- self$sample_id_to_index[current_sample_ids]
-          full_mat[sample_indices,] <- mat_data
-          
-          # Create corresponding mask (1 where data is present, 0 where missing)
-          mask <- !is.na(full_mat)
-          
-          # Convert to tensors
-          self$data[[name]] <- torch_tensor(full_mat, dtype=torch_float32())
-          mask_name <- paste0(name, "_mask")
-          self$data[[mask_name]] <- torch_tensor(mask, dtype=torch_float32())
-          
-        }, error = function(e) {
-          warning(sprintf("Could not convert %s to tensor: %s", name, e$message))
-          self$data[[name]] <- NULL
-          self$features[[name]] <- NULL
-          self$sample_ids[[name]] <- NULL
-        })
+    # Process outcomes if provided
+    if (!is.null(outcome_info)) {
+      if (outcome_info$type == "binary") {
+        self$outcomes <- list(
+          binary = torch_tensor(as.numeric(self$data$clinical[[outcome_info$var]]))
+        )
+      } else if (outcome_info$type == "survival") {
+        self$outcomes <- list(
+          time = torch_tensor(as.numeric(self$data$clinical[[outcome_info$time_var]])),
+          event = torch_tensor(as.numeric(self$data$clinical[[outcome_info$event_var]]))
+        )
       }
     }
     
-    # Debug info
-    cat("Dataset initialized with", self$n_samples, "unique samples\n")
-    cat("Available modalities:\n")
-    for (name in names(self$data)) {
-      if (!grepl("_features$|_mask$", name) && !is.null(self$data[[name]])) {
-        n_available <- length(self$sample_ids[[name]])  # Use original sample count
-        cat(sprintf("- %s: %dx%d (%d features, %d samples available)\n", 
-                   name, 
-                   self$n_samples,
-                   length(self$features[[name]]),
-                   length(self$features[[name]]),
-                   n_available))
+    # Print final dataset information
+    cat("\nDataset dimensions after alignment:\n")
+    for (modality in modalities) {
+      if (!is.null(self$data[[modality]])) {
+        dimensions <- dim(self$data[[modality]])
+        cat(sprintf("- %s: %s\n", modality, paste(dimensions, collapse=" x ")))
       }
     }
   },
   
-   .getitem = function(index) {
-    batch_data <- list()
-    batch_masks <- list()
+  .getitem = function(index) {
+    # Initialize data and mask lists
+    data_list <- list()
+    masks_list <- list()
     
-    modality_names <- unique(gsub("(_features|_mask)$", "", names(self$data)))
+    # Get current sample ID
+    current_sample_id <- names(self$sample_id_to_index)[index]
     
-    for (modality in modality_names) {
-        if (grepl("_features$|_mask$", modality)) next
+    # Process each modality
+    for (modality in names(self$data)) {
+      if (!is.null(self$data[[modality]])) {
+        # Get data for current sample
+        data_values <- as.matrix(self$data[[modality]][index, -1, drop = FALSE])
         
-        data_name <- modality
-        mask_name <- paste0(modality, "_mask")
+        # Convert to tensors
+        data_list[[modality]] <- torch_tensor(
+          data_values,
+          dtype = torch_float32()
+        )
         
-        if (!is.null(self$data[[data_name]])) {
-            batch_data[[modality]] <- self$data[[data_name]][index,]
-            batch_masks[[modality]] <- self$data[[mask_name]][index,]
-        }
+        # Create mask (1 where data exists, 0 where NA)
+        masks_list[[modality]] <- torch_tensor(
+          !is.na(data_values),
+          dtype = torch_float32()
+        )
+        
+        # Replace NA values with 0 in data tensor
+        data_list[[modality]][is.na(data_list[[modality]])] <- 0
+      }
     }
     
-    list(
-        sample_id = self$unified_sample_ids[index],
-        data = batch_data,
-        masks = batch_masks,
-        features = self$features
+    # Create batch
+    batch <- list(
+      sample_id = current_sample_id,
+      data = data_list,
+      masks = masks_list,
+      features = self$features
     )
+    
+    # Add outcomes if they exist
+    if (!is.null(self$outcomes)) {
+      batch$outcomes <- lapply(self$outcomes, function(outcome) {
+        outcome[index]
+      })
+    }
+    
+    return(batch)
   },
-
-
+  
   .length = function() {
     self$n_samples
-  },
-  
-  get_feature_names = function(modality) {
-    if (!is.null(self$features[[modality]])) {
-      return(self$features[[modality]])
-    } else {
-      warning(sprintf("No features found for modality: %s", modality))
-      return(NULL)
-    }
-  },
-  
-  get_sample_ids = function(modality = NULL) {
-    if (is.null(modality)) {
-      return(self$unified_sample_ids)
-    } else if (!is.null(self$sample_ids[[modality]])) {
-      return(self$sample_ids[[modality]])
-    }
-    warning("No sample IDs found")
-    return(NULL)
   }
 )
 
-# Helper function to create torch datasets
-create_torch_datasets <- function(data_list, config) {
-  cat("Creating torch datasets with the following data:\n")
-  for (name in names(data_list)) {
-    if (!is.null(data_list[[name]])) {
-      cat(sprintf("- %s: %s (%s)\n", 
-                 name, 
-                 paste(dim(data_list[[name]]), collapse="x"),
-                 class(data_list[[name]])[1]))
+#' Create torch datasets with proper outcome handling
+#' @param data_list List of data matrices/dataframes for each modality
+#' @param config Model configuration
+#' @param outcome_info List specifying outcome variable(s)
+#' @return MultiModalDataset object
+
+create_torch_datasets <- function(data_list, config, outcome_info = NULL) {
+    # Print initial dataset information
+    cat("Creating torch datasets with the following data:\n")
+    for (name in names(data_list)) {
+        if (!is.null(data_list[[name]])) {
+            cat(sprintf("- %s: %s (%s)\n",
+                       name,
+                       paste(dim(data_list[[name]]), collapse="x"),
+                       class(data_list[[name]])[1]))
+        }
     }
-  }
-  
-  dataset <- MultiModalDataset(data_list)
-  return(dataset)
+    
+    # Create masks for each modality
+    masked_data <- list()
+    for (modality in names(data_list)) {
+        if (!is.null(data_list[[modality]])) {
+            # Store original data
+            masked_data[[modality]] <- data_list[[modality]]
+            
+            # Create mask (1 for data, 0 for NA)
+            mask <- !is.na(as.matrix(data_list[[modality]][,-1])) # exclude sample_id
+            masked_data[[paste0(modality, "_mask")]] <- mask
+            
+            cat(sprintf("Created mask for %s: %d x %d with %.1f%% valid values\n",
+                       modality,
+                       nrow(mask),
+                       ncol(mask),
+                       100 * mean(mask, na.rm=TRUE)))
+        }
+    }
+    
+    # Create dataset with masks
+    dataset <- MultiModalDataset(
+        data = masked_data,
+        outcome_info = outcome_info
+    )
+    
+    return(dataset)
 }
 
-update_dimensions = function(new_dims) {
+
+update_dimensions <- function(new_dims) {
   # Update modality dimensions
   self$modality_dims <- new_dims
-
+  
   # Recreate encoders with new dimensions
   encoders_dict <- list()
   for (name in names(new_dims)) {
@@ -177,7 +201,7 @@ update_dimensions = function(new_dims) {
     orig_dims <- self$encoder_dims[[name]]
     dim_ratios <- orig_dims / self$modality_dims[[name]]
     new_encoder_dims <- ceiling(new_dims[[name]] * dim_ratios)
-
+    
     # Create new encoder
     encoders_dict[[name]] <- EnhancedModalityEncoder(
       input_dim = new_dims[[name]],
@@ -186,10 +210,10 @@ update_dimensions = function(new_dims) {
       dropout = self$dropout
     )
   }
-
+  
   # Update encoder dictionary
   self$encoders <- nn_module_dict(encoders_dict)
-
+  
   # Update fusion module if needed
   final_encoder_dims <- sapply(new_encoder_dims, function(x) x[length(x)])
   self$fusion <- ModalityFusion(
