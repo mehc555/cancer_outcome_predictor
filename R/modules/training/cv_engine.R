@@ -15,12 +15,9 @@ library(glmnet)
 get_stratification_vector <- function(datasets, outcome_type = "binary", outcome_var=NULL) {
     # Handle both MultiModalDataset and list inputs
     if (inherits(datasets, "MultiModalDataset")) {
-        clinical_data <- as.matrix(datasets$data$clinical$cpu())
-        clinical_features <- datasets$data$clinical_features
-    } else {
-        clinical_data <- as.matrix(datasets$clinical$cpu())
-        clinical_features <- datasets$clinical_features
-    }
+        clinical_data <- as.matrix(datasets$data$clinical)
+        clinical_features <- datasets$features$clinical
+    } 
     
     if (outcome_type == "binary") {
         event_col <- which(clinical_features == outcome_var)
@@ -257,7 +254,8 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     shuffle = FALSE,
     collate_fn = custom_collate
   )
-  
+ 
+    # Initialize optimizer and scheduler
   optimizer <- optim_adam(
     model$parameters,
     lr = config$model$optimizer$lr,
@@ -270,69 +268,51 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     factor = config$model$scheduler$factor
   )
   
+
+
+
+  # Training state variables
   best_val_loss <- Inf
   patience_counter <- 0
   best_model_state <- model$state_dict()
   training_history <- list()
   
-  message("Starting training...")
+  # Main training loop
   for (epoch in 1:config$model$max_epochs) {
-    model$train()
+    # === TRAINING PHASE ===
+    model$train()  # Set model to training mode
     train_losses <- c()
     train_metrics <- list()
-    
-        #batch <- coro::collect(train_loader, 1)[[1]]
-	#cat("Batch data dimensions:\n")
-	#for (name in names(batch$data)) {
-  	#if (!is.null(batch$data[[name]])) {
-    	#cat(sprintf("%s: %s\n", name, paste(batch$data[[name]]$size(), collapse=" x ")))
-  	#}
-	#}
- 
-    coro::loop(for (batch in train_loader) {
-  optimizer$zero_grad()
-  
-  tryCatch({
-    output <- model(batch$data, batch$masks)
-    
-    if (outcome_type == "binary") {
-      target <- batch$outcomes$binary
-      # Ensure target has same shape as predictions
-      target <- target$unsqueeze(2)
-      
-      loss <- masked_bce_loss(
-        output$predictions,
-        target,
-        batch$masks$clinical
-      )
-      
-    } else if (outcome_type == "survival") {
-      loss <- compute_cox_loss(
-        output$predictions,
-        batch$outcomes$time,
-        batch$outcomes$event
-      )
-    }
 
-    if (!is.nan(loss$item()) && !is.infinite(loss$item())) {
-      loss$backward()
-      optimizer$step()
+    #batch <- coro::collect(train_loader, 1)[[1]]
+    #cat("Batch data dimensions:\n")
+    #for (name in names(batch$data)) {
+    #if (!is.null(batch$data[[name]])) {
+    #cat(sprintf("%s: %s\n", name, paste(batch$data[[name]]$size(), collapse=" x ")))
+    #}
+    #}
+  
+
+    # Training loop - WITH gradients
+    coro::loop(for (batch in train_loader) {
+      optimizer$zero_grad()  # Zero out gradients
+      
+      # Forward pass
+      output <- model(batch$data)
+      target <- batch$outcomes$binary$unsqueeze(2)
+      
+      # Compute loss
+      loss <- compute_bce_loss(output$predictions, target)
+      
+      # Backward pass and optimization
+      loss$backward()  # Compute gradients
+      optimizer$step() # Update weights
+      
+      # Store metrics
       train_losses <- c(train_losses, loss$item())
+      batch_metrics <- calculate_binary_metrics(output$predictions, target)
       
-      if (outcome_type == "binary") {
-        batch_metrics <- calculate_binary_metrics(
-          output$predictions, 
-          target,
-          batch$masks$clinical
-        )
-      } else {
-        batch_metrics <- calculate_survival_metrics(
-          output$predictions, 
-          batch$outcomes$time, 
-          batch$outcomes$event
-        )
-      }
-      
+      # Accumulate batch metrics
       for (metric_name in names(batch_metrics)) {
         if (is.null(train_metrics[[metric_name]])) {
           train_metrics[[metric_name]] <- c()
@@ -342,111 +322,87 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
           batch_metrics[[metric_name]]
         )
       }
-    } else {
-      warning("Skipping batch due to invalid loss value")
-    }
+    })
     
-  }, error = function(e) {
-    # Print more detailed error information for debugging
-    cat("Error details:\n")
-    cat("Batch structure:\n")
-    str(batch, max.level = 2)
-    cat("\nOutput structure:\n")
-    str(output, max.level = 2)
-    warning(sprintf("Error in training batch: %s", e$message))
-  })
-  })
- 
-
-    model$eval()
+    # === VALIDATION PHASE ===
+    model$eval()  # Set model to evaluation mode
     val_losses <- c()
     val_metrics <- list()
     
-    with_no_grad({
+    # Validation loop - WITHOUT gradients
+    with_no_grad({  # Disable gradient computation
       coro::loop(for (batch in val_loader) {
-        tryCatch({
-          output <- model(batch$data)
-          
-          if (outcome_type == "binary") {
-            target <- torch_index_select(
-              batch$data$clinical,
-              dim = 2,
-              index = torch_tensor(outcome_idx - 1, dtype = torch_long())
-            )$squeeze(2)
-            
-            target <- target$to(dtype = torch_float())
-            target <- target$unsqueeze(2)
-            
-            loss <- masked_bce_loss(
-              output$predictions,
-              target,
-              batch$masks$clinical
-            )
-          } else if (outcome_type == "survival") {
-            time <- torch_index_select(
-              batch$data$clinical,
-              dim = 2,
-              index = torch_tensor(time_idx - 1, dtype = torch_long())
-            )$squeeze(2)
-            
-            event <- torch_index_select(
-              batch$data$clinical,
-              dim = 2,
-              index = torch_tensor(event_idx - 1, dtype = torch_long())
-            )$squeeze(2)
-            
-            loss <- compute_cox_loss(output$predictions, time, event)
+        # Forward pass only
+        output <- model(batch$data)
+        target <- batch$outcomes$binary$unsqueeze(2)
+        
+        # Compute validation loss
+        loss <- compute_bce_loss(output$predictions, target)
+        
+        # Store metrics
+        val_losses <- c(val_losses, loss$item())
+        batch_metrics <- calculate_binary_metrics(output$predictions, target)
+        
+        # Accumulate batch metrics
+        for (metric_name in names(batch_metrics)) {
+          if (is.null(val_metrics[[metric_name]])) {
+            val_metrics[[metric_name]] <- c()
           }
-          
-          if (!is.nan(loss$item()) && !is.infinite(loss$item())) {
-            val_losses <- c(val_losses, loss$item())
-            
-            if (outcome_type == "binary") {
-              batch_metrics <- calculate_binary_metrics(
-                output$predictions, 
-                target,
-                batch$masks$clinical
-              )
-            } else {
-              batch_metrics <- calculate_survival_metrics(
-                output$predictions, 
-                time, 
-                event
-              )
-            }
-            
-            for (metric_name in names(batch_metrics)) {
-              if (is.null(val_metrics[[metric_name]])) {
-                val_metrics[[metric_name]] <- c()
-              }
-              val_metrics[[metric_name]] <- c(
-                val_metrics[[metric_name]], 
-                batch_metrics[[metric_name]]
-              )
-            }
-          }
-          
-        }, error = function(e) {
-          warning(sprintf("Error in validation batch: %s", e$message))
-        })
+          val_metrics[[metric_name]] <- c(
+            val_metrics[[metric_name]], 
+            batch_metrics[[metric_name]]
+          )
+        }
       })
     })
-    
+     
+   
+    # === EPOCH SUMMARY ===
     if (length(train_losses) > 0 && length(val_losses) > 0) {
+      # Calculate epoch metrics
       epoch_metrics <- list(
         train_loss = mean(train_losses),
         val_loss = mean(val_losses)
       )
-      
-      for (metric_name in names(train_metrics)) {
-        epoch_metrics[[paste0("train_", metric_name)]] <- mean(train_metrics[[metric_name]])
-        epoch_metrics[[paste0("val_", metric_name)]] <- mean(val_metrics[[metric_name]])
+
+      # Function to safely calculate mean
+      safe_mean <- function(x) {
+        if (is.numeric(x)) {
+          return(mean(x, na.rm = TRUE))
+        } else if (is.list(x)) {
+          return(x[[length(x)]])  # Take the last value for lists
+        } else {
+          return(NA)
+        }
       }
-      
+    
+      # Add other metrics
+      numeric_metrics <- c("accuracy", "precision", "recall", "f1", "auc", "n_valid", "n_total")
+
+      for (metric_name in numeric_metrics) {
+        if (!is.null(train_metrics[[metric_name]])) {
+          epoch_metrics[[paste0("train_", metric_name)]] <- safe_mean(train_metrics[[metric_name]])
+        }
+        if (!is.null(val_metrics[[metric_name]])) {
+          epoch_metrics[[paste0("val_", metric_name)]] <- safe_mean(val_metrics[[metric_name]])
+        }
+      }
+    
+      # Handle class balance separately
+      if (!is.null(train_metrics$class_balance)) {
+        epoch_metrics$train_class_balance <- train_metrics$class_balance[[length(train_metrics$class_balance)]]
+      }
+      if (!is.null(val_metrics$class_balance)) {
+        epoch_metrics$val_class_balance <- val_metrics$class_balance[[length(val_metrics$class_balance)]]
+      }
+
+      # Store history
       training_history[[epoch]] <- epoch_metrics
-      
+
+      # Learning rate scheduling
       scheduler$step(epoch_metrics$val_loss)
-      
+
+      # Early stopping check
       if (epoch_metrics$val_loss < best_val_loss - config$model$early_stopping$min_delta) {
         best_val_loss <- epoch_metrics$val_loss
         best_model_state <- model$state_dict()
@@ -454,26 +410,61 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       } else {
         patience_counter <- patience_counter + 1
       }
-      
-      if (epoch %% config$model$print_every == 0) {
-        message(sprintf(
-          "Epoch %d/%d - Train Loss: %.4f - Val Loss: %.4f",
-          epoch, config$model$max_epochs,
-          epoch_metrics$train_loss, epoch_metrics$val_loss
-        ))
+    
+      # Print progress (with default print_every if not in config)
+      print_every <- if (!is.null(config$model$print_every)) {
+        config$model$print_every
+      } else {
+        1  # default to printing every epoch
       }
-      
-      if (patience_counter >= config$model$early_stopping$patience) {
-        message(sprintf("Early stopping triggered at epoch %d", epoch))
-        break
-      }
-    } else {
-      warning(sprintf("Epoch %d had no valid losses", epoch))
+    	
+    
+     if (epoch %% print_every == 0) {
+    	message(sprintf(
+      	"\nEpoch %d/%d", epoch, config$model$max_epochs
+       	))
+    	message(sprintf(
+      	"Train - Loss: %.4f, Acc: %.4f, F1: %.4f",
+      	epoch_metrics$train_loss,
+      	epoch_metrics$train_accuracy,
+      	epoch_metrics$train_f1
+    	))
+    	message(sprintf(
+      	"Val   - Loss: %.4f, Acc: %.4f, F1: %.4f",
+      	epoch_metrics$val_loss,
+      	epoch_metrics$val_accuracy,
+      	epoch_metrics$val_f1
+    	))
+     
+    	# Print class balance with safety checks
+     
+    	train_balance <- get_class_balance(train_metrics)
+    	val_balance <- get_class_balance(val_metrics)
+
+    	if (!is.null(train_balance)) {
+      	message(sprintf(
+        "Train Class Balance - Pos: %d, Neg: %d",
+        train_balance$positive,
+        train_balance$negative
+      	))
+    	}
+     
+    	if (!is.null(val_balance)) {
+      	message(sprintf(
+        "Val Class Balance   - Pos: %d, Neg: %d",
+        val_balance$positive,
+        val_balance$negative
+      	))
+    	}
+     }
+    
+	epoch_metrics$train_class_balance <- get_class_balance(train_metrics)
+  	epoch_metrics$val_class_balance <- get_class_balance(val_metrics)
     }
   }
-  
-  model$load_state_dict(best_model_state)
-  
+
+  # Load best model and return results
+  model$load_state_dict(best_model_state)  
   list(
     model = model,
     history = training_history,
@@ -521,6 +512,10 @@ compute_cox_loss <- function(predictions, times, events) {
 # Helper function for calculating binary metrics with masks
 
 calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
+  cat("\nCalculating binary metrics:\n")
+  cat(sprintf("Predictions shape: %s\n", paste(predictions$size(), collapse=" x ")))
+  cat(sprintf("Targets shape: %s\n", paste(targets$size(), collapse=" x ")))
+  
   # Handle NaNs in predictions
   predictions <- torch_where(
     torch_isnan(predictions),
@@ -536,23 +531,33 @@ calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
   preds <- preds$cpu()
   targets <- targets$cpu()
   
-  # Create validity mask (non-NaN values)
-  valid_mask <- torch_ones_like(targets, dtype = torch_bool())
-  if (!is.null(masks)) {
-    valid_mask <- valid_mask & masks$cpu()
-  }
-  valid_mask <- valid_mask & !torch_isnan(targets)
+  # Create validity mask (just check for NaN in targets)
+  valid_mask <- !torch_isnan(targets)
+  
+  # Print initial mask state
+  cat(sprintf("\nValid samples (non-NaN targets): %d\n", valid_mask$sum()$item()))
   
   # Apply mask to predictions and targets
   valid_preds <- preds[valid_mask]
   valid_targets <- targets[valid_mask]
   valid_probs <- probs$cpu()[valid_mask]
   
+  # Calculate class distribution
+  n_positive <- torch_sum(valid_targets)$item()
+  n_negative <- valid_mask$sum()$item() - n_positive
+  cat(sprintf("\nClass distribution in batch:\n"))
+  cat(sprintf("Positive samples: %d\n", n_positive))
+  cat(sprintf("Negative samples: %d\n", n_negative))
+  
   # Calculate metrics only on valid data
   tp <- torch_sum(valid_preds * valid_targets)$item()
   fp <- torch_sum(valid_preds * (1 - valid_targets))$item()
   fn <- torch_sum((1 - valid_preds) * valid_targets)$item()
   tn <- torch_sum((1 - valid_preds) * (1 - valid_targets))$item()
+  
+  cat(sprintf("\nConfusion matrix:\n"))
+  cat(sprintf("TP: %d, FP: %d\n", tp, fp))
+  cat(sprintf("FN: %d, TN: %d\n", fn, tn))
   
   # Count valid samples
   n_valid <- valid_mask$sum()$item()
@@ -564,18 +569,35 @@ calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
     recall <- if (tp + fn > 0) tp / (tp + fn) else 0
     f1 <- if (precision + recall > 0) 2 * (precision * recall) / (precision + recall) else 0
     
-    # Calculate AUC-ROC if possible
-    auc <- tryCatch({
-      valid_probs_cpu <- as.numeric(valid_probs)
-      valid_targets_cpu <- as.numeric(valid_targets)
-      if (length(unique(valid_targets_cpu)) > 1) {  # Check if we have both classes
+    # Calculate AUC-ROC only if we have both classes
+    auc <- if (n_positive > 0 && n_negative > 0) {
+      tryCatch({
+        valid_probs_cpu <- as.numeric(valid_probs)
+        valid_targets_cpu <- as.numeric(valid_targets)
         pROC::auc(pROC::roc(valid_targets_cpu, valid_probs_cpu, quiet = TRUE))
-      } else {
+      }, error = function(e) {
+        cat(sprintf("AUC calculation error: %s\n", e$message))
         NA
-      }
-    }, error = function(e) NA)
+      })
+    } else {
+      cat("\nSkipping AUC calculation - need samples from both classes\n")
+      NA
+    }
+    
+    cat(sprintf("\nMetrics calculated:\n"))
+    cat(sprintf("Accuracy: %.4f\n", accuracy))
+    cat(sprintf("Precision: %.4f\n", precision))
+    cat(sprintf("Recall: %.4f\n", recall))
+    cat(sprintf("F1: %.4f\n", f1))
+    if (!is.na(auc)) {
+      cat(sprintf("AUC: %.4f\n", auc))
+    } else {
+      cat("AUC: NA (insufficient class diversity in batch)\n")
+    }
+    
   } else {
     # Return NA for all metrics if no valid samples
+    cat("\nNo valid samples for metric calculation\n")
     accuracy <- NA
     precision <- NA
     recall <- NA
@@ -589,8 +611,12 @@ calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
     recall = recall,
     f1 = f1,
     auc = auc,
-    n_valid = n_valid,  # Added to track number of valid samples
-    n_total = length(targets)  # Added to track total samples
+    n_valid = n_valid,
+    n_total = length(targets),
+    class_balance = list(
+      positive = n_positive,
+      negative = n_negative
+    )
   )
 }
 
@@ -993,10 +1019,10 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     message(sprintf("- Modalities: %s", paste(names(datasets$features), collapse=", ")))
     
     # Run a quick subset test
-    test_subset <- try(subset_datasets(datasets, 1:5))
-    if (inherits(test_subset, "try-error")) {
-        stop("Dataset subsetting test failed. Cannot proceed with CV.")
-    }
+    #test_subset <- try(subset_datasets(datasets, 1:5))
+    #if (inherits(test_subset, "try-error")) {
+    #    stop("Dataset subsetting test failed. Cannot proceed with CV.")
+    #}
 
 
     # Get stratification vector
@@ -1626,3 +1652,27 @@ validate_sample_consistency <- function(datasets, cancer_type) {
 
     return(TRUE)
 }
+
+# Function to safely calculate mean
+  safe_mean <- function(x) {
+    if (is.numeric(x)) {
+      return(mean(x, na.rm = TRUE))
+    } else if (is.list(x)) {
+      return(x[[length(x)]])  # Take the last value for lists
+    } else {
+      return(NA)
+    }
+  }
+
+  # Function to safely get class balance
+  get_class_balance <- function(metrics) {
+    if (is.null(metrics$class_balance)) return(NULL)
+    if (is.list(metrics$class_balance)) {
+      last_balance <- metrics$class_balance[[length(metrics$class_balance)]]
+      if (is.list(last_balance)) {
+        return(last_balance)
+      }
+    }
+    return(NULL)
+  }
+

@@ -337,25 +337,39 @@ print_tensor_info <- function(tensor, name) {
     cat(sprintf("%s shape: %s\n", name, paste(tensor$size(), collapse=" x ")))
 }
 
-# BCE loss with masking
-masked_bce_loss <- function(predictions, targets, masks) {
+# BCE loss for binary outcomes
+compute_bce_loss <- function(predictions, targets) {
+  cat(sprintf("\nComputing BCE loss:\n"))
+  cat(sprintf("Predictions shape: %s\n", paste(predictions$size(), collapse=" x ")))
+  cat(sprintf("Targets shape: %s\n", paste(targets$size(), collapse=" x ")))
+  
+  # Handle NaNs in predictions
   predictions <- torch_where(
     torch_isnan(predictions),
     torch_zeros_like(predictions),
     predictions
   )
   
-  criterion <- nn_bce_with_logits_loss(reduction = 'none')
-  loss <- criterion(predictions, targets)
+  # Create validity mask for targets
+  valid_mask <- !torch_isnan(targets)
   
-  if (!is.null(masks)) {
-    loss <- loss * masks
-  }
+  # Get number of valid samples
+  n_valid <- valid_mask$sum()$item()
+  cat(sprintf("Valid samples: %d\n", n_valid))
   
-  valid_loss <- loss[!torch_isnan(loss)]
-  if (valid_loss$numel() > 0) {
-    return(torch_mean(valid_loss))
+  if (n_valid > 0) {
+    # Use only valid predictions and targets
+    valid_predictions <- predictions[valid_mask]
+    valid_targets <- targets[valid_mask]
+    
+    # Compute loss using BCE with logits
+    criterion <- nn_bce_with_logits_loss(reduction = 'mean')
+    loss <- criterion(valid_predictions, valid_targets)
+    
+    cat(sprintf("Loss value: %.4f\n", loss$item()))
+    return(loss)
   } else {
+    cat("No valid samples, returning zero loss\n")
     return(torch_tensor(0.0))
   }
 }
