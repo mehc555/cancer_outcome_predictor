@@ -25,6 +25,7 @@ EncoderBlock <- nn_module(
   }
 )
 
+# Updated MLPBlock to properly handle dimensions
 MLPBlock <- nn_module(
   "MLPBlock",
   initialize = function(dim, expansion_factor = 4, dropout = 0.1) {
@@ -35,33 +36,36 @@ MLPBlock <- nn_module(
       nn_linear(dim, hidden_dim),
       nn_gelu(),
       nn_dropout(dropout),
-      nn_linear(hidden_dim, dim),
+      nn_linear(hidden_dim, dim),  # Makes sure we return to original dimension
       nn_dropout(dropout)
     )
     self$norm <- nn_layer_norm(dim, dim)
   },
   
   forward = function(x) {
-    # Print detailed shape information
-    cat(sprintf("\nMLPBlock forward:\n"))
+    cat(sprintf("\nMLPBlock forward pass:\n"))
     cat(sprintf("Input shape: %s\n", paste(x$size(), collapse=" x ")))
     
+    # Store residual
     residual <- x
-    cat("Applying norm...\n")
+    
+    # Apply normalization
     x <- self$norm(x)
     cat(sprintf("After norm shape: %s\n", paste(x$size(), collapse=" x ")))
     
-    cat("Applying network...\n")
+    # Apply network
     x <- self$net(x)
     cat(sprintf("After net shape: %s\n", paste(x$size(), collapse=" x ")))
     
-    cat("Adding residual...\n")
+    # Add residual
     x <- x + residual
-    cat(sprintf("Final shape: %s\n", paste(x$size(), collapse=" x ")))
-    x
+    cat(sprintf("Final output shape: %s\n", paste(x$size(), collapse=" x ")))
+    
+    return(x)
   }
 )
 
+# Updated ModalityFusion to properly handle dimensions
 ModalityFusion <- nn_module(
   "ModalityFusion",
   initialize = function(modality_dims, fusion_dim, dropout = 0.1) {
@@ -69,113 +73,126 @@ ModalityFusion <- nn_module(
     cat("Input dimensions per modality:\n")
     print(modality_dims)
     cat("Fusion dimension:", fusion_dim, "\n")
-
+    
+    self$fusion_dim <- fusion_dim
+    
     # Create projections for each modality
     projections_dict <- list()
     for (name in names(modality_dims)) {
-      cat(sprintf("Creating projection for %s: %d -> %d\n",
-                 name, modality_dims[[name]], fusion_dim))
-
-      # Since encoders output fusion_dim, no need for initial projection
+      cat(sprintf("Creating projection for %s\n", name))
       projections_dict[[name]] <- MLPBlock(fusion_dim, dropout = dropout)
     }
-
+    
     self$modality_projections <- nn_module_dict(projections_dict)
     self$fusion_mlp <- MLPBlock(fusion_dim, dropout = dropout)
     self$fusion_norm <- nn_layer_norm(fusion_dim, fusion_dim)
     self$dropout <- nn_dropout(dropout)
-    self$fusion_dim <- fusion_dim  # Store for reference
   },
-
+  
   forward = function(modality_features, masks = NULL) {
     cat("\nModalityFusion forward pass:\n")
     projected_features <- list()
-    valid_modality_count <- 0
-
+    
+    # Process each modality
     for (name in names(modality_features)) {
       if (!is.null(modality_features[[name]])) {
         cat(sprintf("\nProcessing %s:\n", name))
         cat(sprintf("Input shape: %s\n", paste(modality_features[[name]]$size(), collapse=" x ")))
-
-        # Apply mask if available
-        current_features <- modality_features[[name]]
-        if (!is.null(masks) && !is.null(masks[[name]])) {
-          current_features <- current_features * masks[[name]]
+        
+        # Verify input dimensions
+        if (modality_features[[name]]$size(2) != self$fusion_dim) {
+          stop(sprintf("Expected input dimension %d for %s, got %d", 
+                      self$fusion_dim, name, modality_features[[name]]$size(2)))
         }
-
-        # Verify dimensions
-        if (!all(current_features$size()[-1] == self$fusion_dim)) {
-          stop(sprintf("Expected features of dimension %d for %s, but got %s",
-                      self$fusion_dim, name, paste(current_features$size()[-1], collapse=" x ")))
-        }
-
-        projected <- self$modality_projections[[name]](current_features)
+        
+        # Project features
+        projected <- self$modality_projections[[name]](modality_features[[name]])
         cat(sprintf("Projected shape: %s\n", paste(projected$size(), collapse=" x ")))
-
+        
         projected_features[[name]] <- projected
-        valid_modality_count <- valid_modality_count + 1
       }
     }
-
-    if (valid_modality_count == 0) {
+    
+    if (length(projected_features) == 0) {
       stop("No valid modalities found for fusion")
     }
-
+    
+    # Stack features
     cat("\nStacking features...\n")
-    # Convert list to tensor
-    feature_names <- names(projected_features)
-    feature_tensors <- lapply(feature_names, function(name) projected_features[[name]])
+    feature_tensors <- lapply(names(projected_features), function(name) projected_features[[name]])
     feature_stack <- torch_stack(feature_tensors, dim = 2)
     cat(sprintf("Stacked shape: %s\n", paste(feature_stack$size(), collapse=" x ")))
-
-    cat("\nAveraging features...\n")
+    
+    # Average across modalities
     fused_features <- feature_stack$mean(dim = 2)
     cat(sprintf("Mean shape: %s\n", paste(fused_features$size(), collapse=" x ")))
-
-    cat("\nFinal processing...\n")
+    
+    # Final processing
     fused_features <- self$fusion_mlp(fused_features)
     fused_features <- self$fusion_norm(fused_features)
     fused_features <- self$dropout(fused_features)
-    cat(sprintf("Final shape: %s\n", paste(fused_features$size(), collapse=" x ")))
-
-    list(features = fused_features)
+    
+    cat(sprintf("Final output shape: %s\n", paste(fused_features$size(), collapse=" x ")))
+    
+    return(list(features = fused_features))
   }
 )
 
-# Modified ModalityEncoder to properly use masks
+# Modified ModalityEncoder to properly iterate over layers and add debugging
 ModalityEncoder <- nn_module(
   "ModalityEncoder",
   initialize = function(input_dim, hidden_dims, dropout = 0.1) {
+    cat(sprintf("\nInitializing ModalityEncoder:\n"))
+    cat(sprintf("Input dim: %d\n", input_dim))
+    cat(sprintf("Hidden dims: %s\n", paste(hidden_dims, collapse=", ")))
+    
     self$layers <- nn_module_list()
     
     current_dim <- input_dim
     for (dim in hidden_dims) {
-      self$layers$append(nn_sequential(
+      cat(sprintf("Adding layer: %d -> %d\n", current_dim, dim))
+      layer <- nn_sequential(
         nn_linear(current_dim, dim),
         nn_batch_norm1d(dim),
         nn_relu(),
         nn_dropout(dropout)
-      ))
+      )
+      self$layers$append(layer)
       current_dim <- dim
     }
+    cat(sprintf("Total layers: %d\n", length(self$layers)))
   },
   
   forward = function(x, mask = NULL) {
+    cat("\nModalityEncoder forward pass:\n")
+    cat(sprintf("Input shape: %s\n", paste(x$size(), collapse=" x ")))
+    
     # Apply mask if provided
     if (!is.null(mask)) {
+      cat("Applying mask\n")
       x <- x * mask
     }
     
     # Replace NaN values with zeros
     x <- torch_where(torch_isnan(x), torch_zeros_like(x), x)
     
-    for (layer in self$layers) {
-      x <- layer(x)
+    # Properly iterate through the module list
+    for (i in 1:length(self$layers)) {
+      cat(sprintf("\nProcessing layer %d\n", i))
+      tryCatch({
+        x <- self$layers[[i]](x)
+        cat(sprintf("Output shape after layer %d: %s\n", 
+                   i, paste(x$size(), collapse=" x ")))
+      }, error = function(e) {
+        cat(sprintf("Error in layer %d: %s\n", i, e$message))
+        stop(e)
+      })
     }
+    
+    cat(sprintf("\nFinal output shape: %s\n", paste(x$size(), collapse=" x ")))
     x
   }
 )
-
 
 MultiModalSurvivalModel <- nn_module(
   "MultiModalSurvivalModel",
