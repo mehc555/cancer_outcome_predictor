@@ -234,7 +234,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     ),
     outcome_info = list(
         type = "binary",
-        var = "demographics_vital_status_alive"
+        var = outcome_var
     )
   )
 
@@ -278,7 +278,8 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
   training_history <- list()
   
   # Main training loop
-  for (epoch in 1:config$model$max_epochs) {
+  for (epoch in 1) {
+  #for (epoch in 1:config$model$max_epochs) {
     # === TRAINING PHASE ===
     model$train()  # Set model to training mode
     train_losses <- c()
@@ -323,9 +324,9 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
         )
       }
     })
-    
+  
     # === VALIDATION PHASE ===
-    model$eval()  # Set model to evaluation mode
+   model$eval()  # Set model to evaluation mode
     val_losses <- c()
     val_metrics <- list()
     
@@ -697,7 +698,7 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         # Second split: Test vs Train from remaining
         test_size <- floor(remaining_samples * test_pct)
         test_indices <- if (!is.null(stratify)) {
-            create_stratified_split(remaining_indices, stratify[remaining_indices], test_size)
+            create_stratified_split(remaining_indices, stratify, test_size)
         } else {
             sample(remaining_indices, test_size)
         }
@@ -829,23 +830,22 @@ create_stratified_split <- function(indices, stratify, size) {
 create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct = 0.3) {
     folds <- lapply(1:n_folds, function(i) {
         # Calculate test size
-        test_size <- floor(length(train_indices) * test_pct)
-        
+	test_size <- floor(length(train_indices) * test_pct)
         if (!is.null(stratify)) {
             # Stratified sampling for test set
-            strata <- unique(stratify[train_indices])
+            strata <- unique(stratify)
             test_idx <- c()
-            
+            #print(strata)
             for (stratum in strata) {
-                stratum_indices <- train_indices[stratify[train_indices] == stratum]
+                stratum_indices <- train_indices[stratify == stratum]
                 stratum_size <- floor(test_size * length(stratum_indices) / length(train_indices))
                 test_idx <- c(test_idx, sample(stratum_indices, stratum_size))
-            }
+                #print(test_idx)
+	    }
         } else {
             # Random sampling for test set
             test_idx <- sample(train_indices, test_size)
-        }
-        
+	}
         # Get training indices by excluding test indices
         fold_train_idx <- setdiff(train_indices, test_idx)
         
@@ -1000,13 +1000,11 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
 #' @return List of results and models
 run_nested_cv <- function(model, datasets, config, cancer_type, 
                          outcome_type = "binary",
-                         validation_pct = 0.1, test_pct = 0.2, 
+                         validation_pct = 0.3, test_pct = 0.3, 
                          seed = NULL, max_workers = 2, batch_size = 32, outcome_var=NULL) {
-    
     
     # Clear memory and set up parallel processing
     gc()
-    options(future.globals.maxSize = 2000 * 1024^2)
     
     # Configure workers based on available memory
     available_memory <- as.numeric(system("free -g | awk 'NR==2 {print $4}'", intern=TRUE))
@@ -1018,15 +1016,9 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     message(sprintf("- Total samples: %d", datasets$n_samples))
     message(sprintf("- Modalities: %s", paste(names(datasets$features), collapse=", ")))
     
-    # Run a quick subset test
-    #test_subset <- try(subset_datasets(datasets, 1:5))
-    #if (inherits(test_subset, "try-error")) {
-    #    stop("Dataset subsetting test failed. Cannot proceed with CV.")
-    #}
-
 
     # Get stratification vector
-    stratify <- get_stratification_vector(datasets, outcome_type, outcome_var)
+    stratify <- as.numeric(get_stratification_vector(datasets, outcome_type, outcome_var))
     
     # Get total number of samples
     n_samples <- datasets$n_samples
@@ -1062,7 +1054,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     fold_features <- list()  # Store selected features for each fold
     
     # Process each repeat
-    for (repeat_idx in 1) {
+    for (repeat_idx in 1:2) {
     #for (repeat_idx in seq_along(cv_splits)) {
         message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
         
@@ -1145,50 +1137,51 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         })
         
         # Evaluate validation set
-        validation_data <- subset_datasets(datasets, repeat_split$validation, batch_size)
-        best_model <- select_best_model(outer_results)
-        validation_results <- evaluate_model(best_model, validation_data, outcome_type)
+        #validation_data <- subset_datasets(datasets, repeat_split$validation, batch_size)
+        #best_model <- select_best_model(outer_results)
+        #validation_results <- evaluate_model(best_model, validation_data, outcome_type)
         
         # Store results
-        results[[repeat_idx]] <- list(
-            repeat_idx = repeat_idx,
-            outer_results = outer_results,
-            validation_results = validation_results,
-            best_model = best_model,
-            features = fold_features[[repeat_idx]]  # Store feature selection results
-        )
+        #results[[repeat_idx]] <- list(
+        #    repeat_idx = repeat_idx,
+        #    outer_results = outer_results,
+        #    validation_results = validation_results,
+        #    best_model = best_model,
+        #    features = fold_features[[repeat_idx]]  # Store feature selection results
+        #)
         
         # Save results
-        saveRDS(
-            results[[repeat_idx]],
-            file.path(config$main$paths$results_dir, cancer_type,
-                     sprintf("repeat_%d_results.rds", repeat_idx))
-        )
+        #saveRDS(
+        #    results[[repeat_idx]],
+        #    file.path(config$main$paths$results_dir, cancer_type,
+        #             sprintf("repeat_%d_results.rds", repeat_idx))
+        #)
         
         # Save feature selection summary
-        feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
-        saveRDS(
-            feature_summary,
-            file.path(config$main$paths$results_dir, cancer_type,
-                     sprintf("repeat_%d_feature_summary.rds", repeat_idx))
-        )
+        #feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
+        #saveRDS(
+        #    feature_summary,
+        #    file.path(config$main$paths$results_dir, cancer_type,
+        #             sprintf("repeat_%d_feature_summary.rds", repeat_idx))
+        #)
+	print("THE END")
     }
     
     # Aggregate results
-    final_results <- aggregate_cv_results(results)
-    final_model <- select_final_model(results)
+    #final_results <- aggregate_cv_results(results)
+    #final_model <- select_final_model(results)
     
     # Add feature analysis to final results
-    final_results$feature_analysis <- analyze_feature_selection(fold_features)
+    #final_results$feature_analysis <- analyze_feature_selection(fold_features)
     
-    list(
-        results = final_results,
-        final_model = final_model,
-        cv_splits = cv_splits,
-        raw_results = results,
-        split_validation = validation_results,
-        fold_features = fold_features  # Include complete feature selection history
-    )
+    #list(
+    #    results = final_results,
+    #    final_model = final_model,
+    #    cv_splits = cv_splits,
+    #    raw_results = results,
+    #    split_validation = validation_results,
+    #    fold_features = fold_features  # Include complete feature selection history
+    #)
 }
 
 #' Analyze feature selection patterns across folds

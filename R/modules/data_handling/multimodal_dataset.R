@@ -54,6 +54,11 @@ MultiModalDataset <- dataset(
           check.names = FALSE
         )
         
+        # Create mask as a matrix with row numbers preserved
+        mask_matrix <- !is.na(aligned_data)
+        rownames(mask_matrix) <- seq_len(nrow(mask_matrix))
+        self$data[[paste0(modality, "_mask")]] <- mask_matrix
+        
         # Print alignment summary
         n_complete <- sum(complete.cases(aligned_data))
         cat(sprintf("- %s: %d/%d complete samples (%.1f%%)\n", 
@@ -79,7 +84,7 @@ MultiModalDataset <- dataset(
       }
     }
     
-    # Print final dataset information
+    # Print final dataset dimensions
     cat("\nDataset dimensions after alignment:\n")
     for (modality in modalities) {
       if (!is.null(self$data[[modality]])) {
@@ -99,7 +104,7 @@ MultiModalDataset <- dataset(
     
     # Process each modality
     for (modality in names(self$data)) {
-      if (!is.null(self$data[[modality]])) {
+      if (!is.null(self$data[[modality]]) && !grepl("_mask$", modality)) {
         # Get data for current sample
         data_values <- as.matrix(self$data[[modality]][index, -1, drop = FALSE])
         
@@ -109,9 +114,10 @@ MultiModalDataset <- dataset(
           dtype = torch_float32()
         )
         
-        # Create mask (1 where data exists, 0 where NA)
+        # Get mask for current sample (preserving row number)
+        mask_values <- self$data[[paste0(modality, "_mask")]][index, , drop = FALSE]
         masks_list[[modality]] <- torch_tensor(
-          !is.na(data_values),
+          mask_values,
           dtype = torch_float32()
         )
         

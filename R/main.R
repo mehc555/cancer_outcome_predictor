@@ -1,5 +1,7 @@
 # R/main.R
 
+options(future.globals.maxSize = 12000 * 1024^2
+
 # Source base setup
 source("R/setup.R")
 
@@ -114,6 +116,7 @@ main <- function(download=FALSE) {
             config$model,
 	    outcome_info = outcome_info
         )
+	save.rds(torch_datasets,"torch_datasets.rds")
 
 	# Initialize model
 	model <- MultiModalSurvivalModel(
@@ -132,7 +135,7 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
-	max_workers = 2,      # Limit parallel workers
+	max_workers = 1,      # Limit parallel workers
         batch_size = 32,
 	seed = NULL, # using seed defined at the top for now
 	outcome_var = "demographics_vital_status_alive"
