@@ -74,12 +74,12 @@ MultiModalDataset <- dataset(
     if (!is.null(outcome_info)) {
       if (outcome_info$type == "binary") {
         self$outcomes <- list(
-          binary =as.numeric(self$data$clinical[[outcome_info$var]])
+          binary = torch_tensor(as.numeric(self$data$clinical[[outcome_info$var]]))
         )
       } else if (outcome_info$type == "survival") {
         self$outcomes <- list(
-          time = as.numeric(self$data$clinical[[outcome_info$time_var]]),
-          event = as.numeric(self$data$clinical[[outcome_info$event_var]])
+          time = torch_tensor(as.numeric(self$data$clinical[[outcome_info$time_var]])),
+          event = torch_tensor(as.numeric(self$data$clinical[[outcome_info$event_var]]))
         )
       }
     }
