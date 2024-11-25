@@ -219,24 +219,27 @@ inspect_batch <- function(batch, verbose = TRUE) {
 #' @param outcome_type Either "binary" or "survival"
 #' @return Trained model, training history, and selected features
 
-train_model <- function(model, train_data, val_data, config, outcome_type = "binary", outcome_var = NULL) {
-  
-  message("Performing feature selection on training data...")
-  selected_features <- select_multimodal_features(
-    train_data$data,
-    n_features = list(
-        cnv = config$model$architecture$modality_dims$cnv,
-        clinical = config$model$architecture$modality_dims$clinical,
-        expression = config$model$architecture$modality_dims$expression,
-        mutations = config$model$architecture$modality_dims$mutations,
-        methylation = config$model$architecture$modality_dims$methylation,
-        mirna = config$model$architecture$modality_dims$mirna
-    ),
-    outcome_info = list(
-        type = "binary",
-        var = outcome_var
+train_model <- function(model, train_data, val_data, config, outcome_type = "binary", outcome_var = NULL, selected_features = NULL) {
+ 
+ if (is.null(selected_features)) {
+    message("Performing feature selection on training data...")
+    selected_features <- select_multimodal_features(
+      train_data$data,
+      n_features = list(
+          cnv = config$model$architecture$modality_dims$cnv,
+          clinical = config$model$architecture$modality_dims$clinical,
+          expression = config$model$architecture$modality_dims$expression,
+          mutations = config$model$architecture$modality_dims$mutations,
+          methylation = config$model$architecture$modality_dims$methylation,
+          mirna = config$model$architecture$modality_dims$mirna
+      ),
+      outcome_info = list(
+          type = "binary",
+          var = outcome_var
+      )
     )
-  )
+  }
+
 
   train_data_selected <- apply_feature_selection(train_data, selected_features)
   val_data_selected <- apply_feature_selection(val_data, selected_features)
@@ -278,8 +281,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
   training_history <- list()
   
   # Main training loop
-  for (epoch in 1) {
-  #for (epoch in 1:config$model$max_epochs) {
+  for (epoch in 1:config$model$max_epochs) {
     # === TRAINING PHASE ===
     model$train()  # Set model to training mode
     train_losses <- c()
@@ -463,7 +465,6 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
   	epoch_metrics$val_class_balance <- get_class_balance(val_metrics)
     }
   }
-
   # Load best model and return results
   model$load_state_dict(best_model_state)  
   list(
@@ -472,6 +473,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     best_val_loss = best_val_loss,
     selected_features = selected_features
   )
+  
 }
 
 
@@ -512,11 +514,8 @@ compute_cox_loss <- function(predictions, times, events) {
 
 # Helper function for calculating binary metrics with masks
 
-calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
-  cat("\nCalculating binary metrics:\n")
-  cat(sprintf("Predictions shape: %s\n", paste(predictions$size(), collapse=" x ")))
-  cat(sprintf("Targets shape: %s\n", paste(targets$size(), collapse=" x ")))
-  
+# Modified binary metrics calculation
+calculate_binary_metrics <- function(predictions, targets, masks = NULL, threshold = 0.5) {
   # Handle NaNs in predictions
   predictions <- torch_where(
     torch_isnan(predictions),
@@ -526,100 +525,118 @@ calculate_binary_metrics <- function(predictions, targets, masks = NULL) {
   
   # Convert predictions to probabilities
   probs <- torch_sigmoid(predictions)
-  preds <- (probs > 0.5)$to(dtype = torch_long())
   
-  # Convert to CPU for calculations
-  preds <- preds$cpu()
-  targets <- targets$cpu()
-  
-  # Create validity mask (just check for NaN in targets)
-  valid_mask <- !torch_isnan(targets)
-  
-  # Print initial mask state
-  cat(sprintf("\nValid samples (non-NaN targets): %d\n", valid_mask$sum()$item()))
-  
-  # Apply mask to predictions and targets
-  valid_preds <- preds[valid_mask]
-  valid_targets <- targets[valid_mask]
-  valid_probs <- probs$cpu()[valid_mask]
-  
-  # Calculate class distribution
-  n_positive <- torch_sum(valid_targets)$item()
-  n_negative <- valid_mask$sum()$item() - n_positive
-  cat(sprintf("\nClass distribution in batch:\n"))
-  cat(sprintf("Positive samples: %d\n", n_positive))
-  cat(sprintf("Negative samples: %d\n", n_negative))
-  
-  # Calculate metrics only on valid data
-  tp <- torch_sum(valid_preds * valid_targets)$item()
-  fp <- torch_sum(valid_preds * (1 - valid_targets))$item()
-  fn <- torch_sum((1 - valid_preds) * valid_targets)$item()
-  tn <- torch_sum((1 - valid_preds) * (1 - valid_targets))$item()
-  
-  cat(sprintf("\nConfusion matrix:\n"))
-  cat(sprintf("TP: %d, FP: %d\n", tp, fp))
-  cat(sprintf("FN: %d, TN: %d\n", fn, tn))
-  
-  # Count valid samples
-  n_valid <- valid_mask$sum()$item()
-  
-  # Calculate metrics only if we have valid samples
-  if (n_valid > 0) {
-    accuracy <- (tp + tn) / (tp + fp + fn + tn)
+  # Try different thresholds to find optimal one
+  thresholds <- seq(0.1, 0.9, by = 0.1)
+  metrics_by_threshold <- lapply(thresholds, function(thresh) {
+    preds <- (probs > thresh)$to(dtype = torch_long())
+    
+    # Calculate metrics
+    tp <- torch_sum(preds * targets)$item()
+    fp <- torch_sum(preds * (1 - targets))$item()
+    fn <- torch_sum((1 - preds) * targets)$item()
+    tn <- torch_sum((1 - preds) * (1 - targets))$item()
+    
+    # Calculate F1
     precision <- if (tp + fp > 0) tp / (tp + fp) else 0
     recall <- if (tp + fn > 0) tp / (tp + fn) else 0
     f1 <- if (precision + recall > 0) 2 * (precision * recall) / (precision + recall) else 0
     
-    # Calculate AUC-ROC only if we have both classes
-    auc <- if (n_positive > 0 && n_negative > 0) {
-      tryCatch({
-        valid_probs_cpu <- as.numeric(valid_probs)
-        valid_targets_cpu <- as.numeric(valid_targets)
-        pROC::auc(pROC::roc(valid_targets_cpu, valid_probs_cpu, quiet = TRUE))
-      }, error = function(e) {
-        cat(sprintf("AUC calculation error: %s\n", e$message))
-        NA
-      })
-    } else {
-      cat("\nSkipping AUC calculation - need samples from both classes\n")
-      NA
-    }
-    
-    cat(sprintf("\nMetrics calculated:\n"))
-    cat(sprintf("Accuracy: %.4f\n", accuracy))
-    cat(sprintf("Precision: %.4f\n", precision))
-    cat(sprintf("Recall: %.4f\n", recall))
-    cat(sprintf("F1: %.4f\n", f1))
-    if (!is.na(auc)) {
-      cat(sprintf("AUC: %.4f\n", auc))
-    } else {
-      cat("AUC: NA (insufficient class diversity in batch)\n")
-    }
-    
-  } else {
-    # Return NA for all metrics if no valid samples
-    cat("\nNo valid samples for metric calculation\n")
-    accuracy <- NA
-    precision <- NA
-    recall <- NA
-    f1 <- NA
-    auc <- NA
-  }
+    list(
+      threshold = thresh,
+      f1 = f1,
+      precision = precision,
+      recall = recall
+    )
+  })
+  
+  # Find best threshold
+  f1_scores <- sapply(metrics_by_threshold, function(x) x$f1)
+  best_idx <- which.max(f1_scores)
+  best_threshold <- thresholds[best_idx]
+  
+  # Use best threshold for final predictions
+  preds <- (probs > best_threshold)$to(dtype = torch_long())
+  
+  # Calculate final metrics
+  tp <- torch_sum(preds * targets)$item()
+  fp <- torch_sum(preds * (1 - targets))$item()
+  fn <- torch_sum((1 - preds) * targets)$item()
+  tn <- torch_sum((1 - preds) * (1 - targets))$item()
+  
+  # Calculate class distribution
+  n_positive <- torch_sum(targets)$item()
+  n_negative <- length(targets) - n_positive
+  
+  accuracy <- (tp + tn) / (tp + fp + fn + tn)
+  precision <- if (tp + fp > 0) tp / (tp + fp) else 0
+  recall <- if (tp + fn > 0) tp / (tp + fn) else 0
+  f1 <- if (precision + recall > 0) 2 * (precision * recall) / (precision + recall) else 0
+  
+  # Calculate balanced accuracy
+  sensitivity <- recall
+  specificity <- tn / (tn + fp)
+  balanced_accuracy <- (sensitivity + specificity) / 2
+  
+  # Calculate AUC
+  auc <- tryCatch({
+    probs_cpu <- as.numeric(probs)
+    targets_cpu <- as.numeric(targets)
+    pROC::auc(pROC::roc(targets_cpu, probs_cpu, quiet = TRUE))
+  }, error = function(e) {
+    NA
+  })
   
   list(
     accuracy = accuracy,
+    balanced_accuracy = balanced_accuracy,
     precision = precision,
     recall = recall,
+    specificity = specificity,
     f1 = f1,
     auc = auc,
-    n_valid = n_valid,
-    n_total = length(targets),
+    best_threshold = best_threshold,
+    n_valid = length(targets),
     class_balance = list(
       positive = n_positive,
       negative = n_negative
+    ),
+    confusion_matrix = list(
+      tp = tp,
+      fp = fp,
+      fn = fn,
+      tn = tn
     )
   )
 }
+
+# Helper function to print detailed metrics
+print_detailed_metrics <- function(metrics) {
+  cat("\nDetailed Performance Metrics:\n")
+  cat(sprintf("Accuracy: %.4f\n", metrics$accuracy))
+  cat(sprintf("Balanced Accuracy: %.4f\n", metrics$balanced_accuracy))
+  cat(sprintf("Precision: %.4f\n", metrics$precision))
+  cat(sprintf("Recall (Sensitivity): %.4f\n", metrics$recall))
+  cat(sprintf("Specificity: %.4f\n", metrics$specificity))
+  cat(sprintf("F1 Score: %.4f\n", metrics$f1))
+  cat(sprintf("AUC: %.4f\n", metrics$auc))
+  cat(sprintf("Best Threshold: %.2f\n", metrics$best_threshold))
+  
+  cat("\nClass Balance:\n")
+  cat(sprintf("Positive: %d (%.1f%%)\n", 
+              metrics$class_balance$positive,
+              100 * metrics$class_balance$positive/metrics$n_valid))
+  cat(sprintf("Negative: %d (%.1f%%)\n", 
+              metrics$class_balance$negative,
+              100 * metrics$class_balance$negative/metrics$n_valid))
+  
+  cat("\nConfusion Matrix:\n")
+  cat(sprintf("True Positives: %d\n", metrics$confusion_matrix$tp))
+  cat(sprintf("False Positives: %d\n", metrics$confusion_matrix$fp))
+  cat(sprintf("False Negatives: %d\n", metrics$confusion_matrix$fn))
+  cat(sprintf("True Negatives: %d\n", metrics$confusion_matrix$tn))
+}
+
 
 #' Calculate metrics for survival prediction
 #' @param predictions Model predictions
@@ -697,18 +714,19 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
         
         # Second split: Test vs Train from remaining
         test_size <- floor(remaining_samples * test_pct)
-        test_indices <- if (!is.null(stratify)) {
-            create_stratified_split(remaining_indices, stratify, test_size)
-        } else {
-            sample(remaining_indices, test_size)
-        }
+        #test_indices <- if (!is.null(stratify)) {
+        #    create_stratified_split(remaining_indices, stratify, test_size)
+        #} else {
+        #    sample(remaining_indices, test_size)
+        #}
         
-        train_indices <- setdiff(remaining_indices, test_indices)
+        #train_indices <- setdiff(remaining_indices, test_indices)
         
         # Create outer folds - each uses full training set
         outer_folds <- create_stratified_folds(
-            train_indices = train_indices,
-            stratify = if (!is.null(stratify)) stratify[train_indices] else NULL,
+            #train_indices = train_indices,
+            train_indices=remaining_indices,
+	    stratify = if (!is.null(stratify)) stratify[remaining_indices] else NULL,
             n_folds = n_outer_folds,
             test_pct = test_pct
         )
@@ -727,7 +745,7 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
             list(
                 name = paste0("K-Fold-", k),
                 train_idx = outer_folds[[k]]$train_idx,
-                test_idx = test_indices,  # Use same test set for all K-folds
+                test_idx =  outer_folds[[k]]$test_idx,
                 inner_folds = inner_folds
             )
         })
@@ -745,18 +763,18 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
             message("\n=== Second Split of Remaining Data ===")
             message(sprintf("Test set: %d samples (%.1f%% of remaining)", 
                           test_size, 100 * test_size/remaining_samples))
-            message(sprintf("Training set: %d samples", length(train_indices)))
+            message(sprintf("Training set: %d samples", remaining_samples-test_size))
             
             message("\n=== K-fold Structure ===")
             message(sprintf("Number of K-folds: %d", n_outer_folds))
             message(sprintf("Full training set (each K-fold): %d samples", 
-                          length(train_indices)))
-            message(sprintf("Fixed test set (all K-folds): %d samples", 
-                          length(test_indices)))
+                          length(outer_folds[[1]]$train_idx)))
+            message(sprintf("Full test set (all K-folds): %d samples", 
+                          length(outer_folds[[1]]$test_idx)))
             
             message("\n=== M-fold Structure (per K-fold) ===")
-            inner_test_size <- floor(length(train_indices) * test_pct)
-            inner_train_size <- length(train_indices) - inner_test_size
+            inner_test_size <- floor(length(outer_folds[[1]]$train_idx) * test_pct)
+            inner_train_size <- length(outer_folds[[1]]$train_idx) - inner_test_size
             message(sprintf("Number of M-folds per K-fold: %d", n_inner_folds))
             message(sprintf("Inner test size: %d samples (%.1f%% of training)", 
                           inner_test_size, 100 * test_pct))
@@ -768,8 +786,8 @@ create_cv_splits <- function(n_samples, n_repeats, n_outer_folds, n_inner_folds,
                 for (split_name in c("Validation", "Test", "Training")) {
                     indices <- switch(split_name,
                                    "Validation" = validation_indices,
-                                   "Test" = test_indices,
-                                   "Training" = train_indices)
+                                   "Test" = outer_folds[[1]]$test_idx,
+                                   "Training" = outer_folds[[1]]$train_idx)
                     counts <- table(stratify[indices])
                     props <- prop.table(counts)
                     message(sprintf("\n%s set distribution:", split_name))
@@ -998,32 +1016,26 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
 #' @param max_workers Maximum number of parallel workers
 #' @param batch_size Batch size for data loading
 #' @return List of results and models
+
 run_nested_cv <- function(model, datasets, config, cancer_type, 
                          outcome_type = "binary",
                          validation_pct = 0.3, test_pct = 0.3, 
                          seed = NULL, max_workers = 2, batch_size = 32, outcome_var=NULL) {
     
-    # Clear memory and set up parallel processing
+    # Initial setup remains the same until outer fold processing
     gc()
     
-    # Configure workers based on available memory
     available_memory <- as.numeric(system("free -g | awk 'NR==2 {print $4}'", intern=TRUE))
     actual_workers <- max(1, min(max_workers, floor(available_memory / 1)))
     message(sprintf("Using %d workers based on available memory", actual_workers))
     
-    # Verify initial dataset
     message("\nVerifying initial dataset:")
     message(sprintf("- Total samples: %d", datasets$n_samples))
     message(sprintf("- Modalities: %s", paste(names(datasets$features), collapse=", ")))
     
-
-    # Get stratification vector
     stratify <- as.numeric(get_stratification_vector(datasets, outcome_type, outcome_var))
-    
-    # Get total number of samples
     n_samples <- datasets$n_samples
     
-    # Create CV splits
     cv_splits <- create_cv_splits(
         n_samples = n_samples,
         n_repeats = config$cv_params$outer_repeats,
@@ -1035,7 +1047,6 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         seed = seed
     )
     
-    # Validate splits
     validation_results <- validate_cv_splits(cv_splits)
     
     if (validation_results$summary$total_overlaps > 0) {
@@ -1046,143 +1057,191 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                        validation_results$summary$max_overlap_percentage))
     }
     
-    # Set up parallel processing
     plan(multisession, workers = actual_workers)
-    
-    # Initialize results storage
+    #future::plan(tweak(multisession, workers = actual_workers, rng = TRUE, future.seed=TRUE))
+
     results <- vector("list", length(cv_splits))
-    fold_features <- list()  # Store selected features for each fold
+    fold_features <- list()
     
-    # Process each repeat
+
+        # Process each repeat
     for (repeat_idx in 1:2) {
-    #for (repeat_idx in seq_along(cv_splits)) {
         message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
-        
         repeat_split <- cv_splits[[repeat_idx]]
         fold_features[[repeat_idx]] <- list()
-        
+
         # Process outer folds in parallel
-        outer_results <- future_lapply(seq_along(repeat_split$outer_splits), 
+        outer_results <- future_lapply(seq_along(repeat_split$outer_splits),
                                      function(fold_idx) {
             model_copy <- model$create_copy()
             outer_split <- repeat_split$outer_splits[[fold_idx]]
-            
+
             # Initialize feature storage for this fold
             fold_features[[repeat_idx]][[fold_idx]] <- list(
                 outer = NULL,
                 inner = list()
             )
-            
-            # Process inner folds
+
+            # Process inner folds to determine best hyperparameters
             inner_results <- lapply(seq_along(outer_split$inner_folds), function(inner_idx) {
-            inner_model <- model$create_copy()
-                
+                inner_model <- model$create_copy()
+
                 # Create datasets for inner fold
                 inner_train_data <- subset_datasets(datasets, outer_split$inner_folds[[inner_idx]]$train_idx, batch_size)
                 inner_val_data <- subset_datasets(datasets, outer_split$inner_folds[[inner_idx]]$test_idx, batch_size)
-                
+
                 # Train inner model with feature selection
                 trained_model <- train_model(
                     model = inner_model,
                     train_data = inner_train_data,
-                    val_data = inner_val_data,
+                    val_data = inner_val_data,  # Using inner validation set for early stopping
                     config = config,
-                    outcome_type = outcome_type
+                    outcome_type = outcome_type,
+		    outcome_var = outcome_var
                 )
-                
-                # Store selected features for this inner fold
-                fold_features[[repeat_idx]][[fold_idx]]$inner[[inner_idx]] <- trained_model$selected_features
-                
+
                 # Clean up
-                rm(inner_model, inner_train_data, inner_val_data)
+
+    		# Prepare validation data with correct features
+		validation_data_selected <- prepare_for_evaluation(trained_model$model, inner_val_data, trained_model$selected_features)
+		
+		# Get validation performance
+		val_results <- evaluate_model(trained_model$model, inner_val_data, outcome_type)
+    
+		#print_detailed_metrics(val_results$metrics)
+		rm(inner_model, inner_train_data, inner_val_data)
                 gc()
-                
-                trained_model
+
+    		list(
+		state_dict = trained_model$model$state_dict(),
+        	val_metrics = val_results$metrics,
+        	selected_features = trained_model$selected_features,
+    		best_val_loss = trained_model$best_val_loss
+		)
             })
-            
-            # Train final model for outer fold
-            outer_train_data <- subset_datasets(datasets, outer_split$train_idx, batch_size)
-            outer_test_data <- subset_datasets(datasets, outer_split$test_idx, batch_size)
-            
-            final_model <- train_model(
-                model = model_copy,
-                train_data = outer_train_data,
-                val_data = outer_test_data,
-                config = config,
-                outcome_type = outcome_type
-            )
-            
+
+
+	    # Find best performing inner model configuration
+	    best_inner_idx <- which.min(sapply(inner_results, function(x) x$best_val_loss))
+	    best_state_dict<- inner_results[[best_inner_idx]]$state_dict
+	    best_features <- inner_results[[best_inner_idx]]$selected_features
+
+	    # Train final model on outer fold using best configuration
+	    outer_train_data <- subset_datasets(datasets, outer_split$train_idx, batch_size)
+	    outer_val_data <- subset_datasets(datasets, outer_split$test_idx, batch_size)
+
+	    # Initialize model with best configuration
+	    model_copy <- model$create_copy()
+	    model_copy$load_state_dict(best_state_dict)
+
+	    # Train final model using best configuration from inner folds
+	    final_model <- train_model(
+    	    model = model_copy,
+            train_data = outer_train_data,
+            val_data = outer_val_data,
+            config = config,
+            outcome_type = outcome_type,
+            outcome_var = outcome_var,
+            selected_features = best_features  # Pass best features from inner folds
+	    )
+
+            # Prepare validation data with correct features
+
+            validation_data_selected <- prepare_for_evaluation(final_model$model, outer_val_data, final_model$selected_features)
+	
+	    # Evaluate on the same validation set
+
+	    test_results <- evaluate_model(final_model$model, outer_val_data, outcome_type)
+
             # Store selected features for outer fold
+
             fold_features[[repeat_idx]][[fold_idx]]$outer <- final_model$selected_features
-            
+
             # Save intermediate results
             results_dir <- file.path(config$main$paths$results_dir, cancer_type)
             if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
-            
-            saveRDS(
-                list(
-                    model = final_model,
-                    features = fold_features[[repeat_idx]][[fold_idx]]
-                ),
-                file.path(results_dir, 
-                         sprintf("repeat_%d_fold_%d_results.rds", 
-                                repeat_idx, fold_idx))
-            )
-            
+
+            #saveRDS(
+            #    list(
+            #        model = final_model,
+            #        features = fold_features[[repeat_idx]][[fold_idx]],
+            #        test_results = test_results,
+            #        inner_results = inner_results
+            #    ),
+            #    file.path(results_dir,
+            #             sprintf("repeat_%d_fold_%d_results.rds",
+            #                    repeat_idx, fold_idx))
+            #)
+
             # Clean up
-            rm(model_copy, outer_train_data, outer_test_data)
+            rm(model_copy, actual_train_data, val_data, test_data)
             gc()
-            
-            final_model
+
+            list(
+                model = final_model$model,
+		state_dict = final_model$model$state_dict(),
+                val_metrics = test_results$metrics,
+		selected_features = final_model$selected_features,
+		best_val_loss = final_model$best_val_loss
+           )
         })
+
+        # Evaluate on hold-out validation set
+        validation_data <- subset_datasets(datasets, repeat_split$validation, batch_size)
         
-        # Evaluate validation set
-        #validation_data <- subset_datasets(datasets, repeat_split$validation, batch_size)
-        #best_model <- select_best_model(outer_results)
-        #validation_results <- evaluate_model(best_model, validation_data, outcome_type)
-        
-        # Store results
-        #results[[repeat_idx]] <- list(
-        #    repeat_idx = repeat_idx,
-        #    outer_results = outer_results,
-        #    validation_results = validation_results,
-        #    best_model = best_model,
-        #    features = fold_features[[repeat_idx]]  # Store feature selection results
-        #)
-        
+	best_outer_idx <- which.min(sapply(outer_results, function(x) x$best_val_loss))
+        best_outer_model <- outer_results[[best_outer_idx]]$model
+	best_outer_state_dict<- outer_results[[best_outer_idx]]$state_dict
+        best_outer_features <- outer_results[[best_outer_idx]]$selected_features
+        best_outer_val_loss <- outer_results[[best_outer_idx]]$best_val_loss
+
+        # Prepare validation data with correct features
+        validation_data_selected <- prepare_for_evaluation(best_outer_model, validation_data, best_outer_features)
+
+        # Now evaluate the model
+        validation_results <- evaluate_model(best_outer_model, validation_data_selected, outcome_type)
+
+	results[[repeat_idx]] <- list(
+            repeat_idx = repeat_idx,
+            outer_results = outer_results,
+            validation_results = validation_results,
+            best_model = best_outer_model,
+            features = best_outer_features,
+	    best_val_loss = best_outer_val_loss
+        )
+
         # Save results
-        #saveRDS(
-        #    results[[repeat_idx]],
-        #    file.path(config$main$paths$results_dir, cancer_type,
-        #             sprintf("repeat_%d_results.rds", repeat_idx))
-        #)
-        
-        # Save feature selection summary
-        #feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
-        #saveRDS(
-        #    feature_summary,
-        #    file.path(config$main$paths$results_dir, cancer_type,
-        #             sprintf("repeat_%d_feature_summary.rds", repeat_idx))
-        #)
-	print("THE END")
+        saveRDS(
+            results[[repeat_idx]],
+            file.path(config$main$paths$results_dir, cancer_type,
+                     sprintf("repeat_%d_results.rds", repeat_idx))
+        )
+
+        feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
+        saveRDS(
+            feature_summary,
+            file.path(config$main$paths$results_dir, cancer_type,
+                     sprintf("repeat_%d_feature_summary.rds", repeat_idx))
+        )
     }
+
+    final_results <- aggregate_cv_results(results)
+    #print_cv_results(final_results)
+
+    final_model <- select_final_model(results)
     
-    # Aggregate results
-    #final_results <- aggregate_cv_results(results)
-    #final_model <- select_final_model(results)
+    final_results$feature_analysis <- analyze_feature_selection()
     
-    # Add feature analysis to final results
-    #final_results$feature_analysis <- analyze_feature_selection(fold_features)
-    
-    #list(
-    #    results = final_results,
-    #    final_model = final_model,
-    #    cv_splits = cv_splits,
-    #    raw_results = results,
-    #    split_validation = validation_results,
-    #    fold_features = fold_features  # Include complete feature selection history
-    #)
+    list(
+        results = final_results,
+        final_model = final_model,
+        cv_splits = cv_splits,
+        raw_results = results,
+        split_validation = validation_results,
+        fold_features = fold_features
+    )
 }
+
 
 #' Analyze feature selection patterns across folds
 #' @param fold_features Nested list of selected features
@@ -1235,48 +1294,154 @@ analyze_feature_selection <- function(fold_features) {
 }
 
 #' Select best model based on validation performance
-#' @param models List of trained models
+#' @param outer_results List of outer fold results containing test performance
 #' @return Best performing model
-select_best_model <- function(models) {
-    performances <- sapply(models, function(m) m$best_val_loss)
+select_best_model <- function(outer_results) {
+    # Extract test loss from each outer fold result
+    performances <- sapply(outer_results, function(r) {
+        r$best_val_loss  # Or another metric you prefer like 'f1', 'accuracy', etc.
+    })
+    
+    # Find best performing model
     best_idx <- which.min(performances)
-    models[[best_idx]]$model
+    
+    # Return the best model
+    outer_results[[best_idx]]$model
 }
+
 
 #' Select final model from all repeats
 #' @param results List of results from all repeats
 #' @return Best performing model
 select_final_model <- function(results) {
-    performances <- sapply(results, function(r) r$validation_results$metrics$primary_metric)
-    best_repeat <- which.max(performances)
+    performances <- sapply(results, function(r) r$best_val_loss)
+    best_repeat <- which.min(performances)
     results[[best_repeat]]$best_model
 }
 
+
 #' Aggregate CV results
 #' @param results List of results from all repeats
-#' @return Aggregated results summary
+#' @return Aggregated results summary with means and standard deviations
 aggregate_cv_results <- function(results) {
-    # Extract metrics
-    validation_metrics <- lapply(results, function(r) r$validation_results$metrics)
-    outer_metrics <- lapply(results, function(r) {
-        lapply(r$outer_results, function(o) o$history[[length(o$history)]])
+    # Extract validation metrics from each repeat
+    validation_metrics <- lapply(results, function(r) {
+        metrics <- r$validation_results$metrics
+        
+        # Extract numeric metrics
+        main_metrics <- list(
+            accuracy = metrics$accuracy,
+            balanced_accuracy = metrics$balanced_accuracy,
+            precision = metrics$precision,
+            recall = metrics$recall,
+            specificity = metrics$specificity,
+            f1 = metrics$f1,
+            auc = as.numeric(metrics$auc)  # Convert AUC object to numeric
+        )
+        
+        # Extract class balance
+        class_balance <- list(
+            positive_samples = metrics$class_balance$positive,
+            negative_samples = metrics$class_balance$negative,
+            pos_neg_ratio = metrics$class_balance$positive / metrics$class_balance$negative
+        )
+        
+        # Extract confusion matrix
+        confusion <- list(
+            true_positives = metrics$confusion_matrix$tp,
+            false_positives = metrics$confusion_matrix$fp,
+            false_negatives = metrics$confusion_matrix$fn,
+            true_negatives = metrics$confusion_matrix$tn
+        )
+        
+        list(
+            metrics = main_metrics,
+            class_balance = class_balance,
+            confusion = confusion
+        )
     })
     
-    # Calculate summary statistics
-    validation_summary <- list(
-        mean = colMeans(do.call(rbind, validation_metrics)),
-        sd = apply(do.call(rbind, validation_metrics), 2, sd)
-    )
+    # Function to compute summary statistics
+    compute_summary <- function(values) {
+        c(
+            mean = mean(unlist(values), na.rm = TRUE),
+            sd = sd(unlist(values), na.rm = TRUE),
+            min = min(unlist(values), na.rm = TRUE),
+            max = max(unlist(values), na.rm = TRUE)
+        )
+    }
     
-    outer_summary <- list(
-        mean = colMeans(do.call(rbind, unlist(outer_metrics, recursive = FALSE))),
-        sd = apply(do.call(rbind, unlist(outer_metrics, recursive = FALSE)), 2, sd)
-    )
+    # Compute summaries for main metrics
+    metric_names <- names(validation_metrics[[1]]$metrics)
+    metrics_summary <- lapply(metric_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$metrics[[metric]])
+        compute_summary(values)
+    })
+    names(metrics_summary) <- metric_names
     
+    # Compute summaries for class balance
+    balance_names <- names(validation_metrics[[1]]$class_balance)
+    balance_summary <- lapply(balance_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$class_balance[[metric]])
+        compute_summary(values)
+    })
+    names(balance_summary) <- balance_names
+    
+    # Compute summaries for confusion matrix
+    confusion_names <- names(validation_metrics[[1]]$confusion)
+    confusion_summary <- lapply(confusion_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$confusion[[metric]])
+        compute_summary(values)
+    })
+    names(confusion_summary) <- confusion_names
+    
+    # Return organized results
     list(
-        validation_summary = validation_summary,
-        outer_summary = outer_summary
+        performance = list(
+            metrics = metrics_summary,
+            class_balance = balance_summary,
+            confusion = confusion_summary
+        ),
+        n_repeats = length(results),
+        n_samples = results[[1]]$validation_results$metrics$n_valid
     )
+}
+
+#' Print formatted CV results
+#' @param results Aggregated CV results
+#' @export
+print_cv_results <- function(results) {
+    cat("\n=== Cross-Validation Results ===")
+    cat(sprintf("\nNumber of repeats: %d", results$n_repeats))
+    cat(sprintf("\nNumber of samples: %d", results$n_samples))
+    
+    # Print main metrics
+    cat("\n\n=== Performance Metrics ===")
+    for(metric in names(results$performance$metrics)) {
+        stats <- results$performance$metrics[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.4f ± %.4f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.4f, %.4f]", stats["min"], stats["max"]))
+    }
+    
+    # Print class balance
+    cat("\n\n=== Class Balance ===")
+    for(metric in names(results$performance$class_balance)) {
+        stats <- results$performance$class_balance[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.2f ± %.2f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.2f, %.2f]", stats["min"], stats["max"]))
+    }
+    
+    # Print confusion matrix
+    cat("\n\n=== Confusion Matrix Statistics ===")
+    for(metric in names(results$performance$confusion)) {
+        stats <- results$performance$confusion[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.2f ± %.2f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.2f, %.2f]", stats["min"], stats["max"]))
+    }
+    cat("\n")
 }
 
 #' Evaluate model performance
@@ -1284,10 +1449,9 @@ aggregate_cv_results <- function(results) {
 #' @param data Test data (MultiModalDataset)
 #' @param outcome_type Either "binary" or "survival"
 #' @return List of evaluation metrics and predictions
-
 evaluate_model <- function(model, data, outcome_type = "binary") {
     model$eval()
-    loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE)
+    loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE, collate_fn = custom_collate)
     
     predictions <- list()
     targets <- list()
@@ -1300,7 +1464,12 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
             predictions[[length(predictions) + 1]] <- output$predictions$cpu()
             
             if (outcome_type == "binary") {
-                targets[[length(targets) + 1]] <- batch$target$cpu()
+                # Extract binary outcome tensor
+                if (!is.null(batch$outcomes$binary)) {
+                    targets[[length(targets) + 1]] <- batch$outcomes$binary$unsqueeze(2)$cpu()
+                } else {
+                    stop("Binary outcomes not found in batch")
+                }
             } else {
                 times[[length(times) + 1]] <- batch$time$cpu()
                 events[[length(events) + 1]] <- batch$event$cpu()
@@ -1311,6 +1480,7 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
     all_predictions <- torch_cat(predictions, dim = 1)
     
     if (outcome_type == "binary") {
+        # Stack all target tensors
         all_targets <- torch_cat(targets, dim = 1)
         metrics <- calculate_binary_metrics(all_predictions, all_targets)
         
@@ -1669,3 +1839,98 @@ validate_sample_consistency <- function(datasets, cancer_type) {
     return(NULL)
   }
 
+
+#' Prepare validation data using model dimensions and selected features
+#' @param model Trained model
+#' @param validation_data Validation dataset
+#' @param selected_features List of features by modality
+#' @return Validation data with selected features
+prepare_validation_features <- function(model, validation_data, selected_features) {
+  cat("\nSelecting features for each modality:\n")
+  selected_data <- validation_data
+  
+  for (modality in names(model$modality_dims)) {
+    if (!is.null(validation_data$data[[modality]])) {
+      current_features <- validation_data$features[[modality]]
+      feature_indices <- match(selected_features[[modality]], current_features)
+      
+      if (any(is.na(feature_indices))) {
+        missing_idx <- which(is.na(feature_indices))
+        stop(sprintf("Missing %s features: %s", 
+                    modality,
+                    paste(selected_features[[modality]][missing_idx[1:min(5, length(missing_idx))]], 
+                          collapse=", ")))
+      }
+      
+      feature_indices <- c(1, feature_indices + 1)
+      selected_data$data[[modality]] <- validation_data$data[[modality]][, feature_indices, drop = FALSE]
+      
+      mask_name <- paste0(modality, "_mask")
+      if (!is.null(validation_data$data[[mask_name]])) {
+        selected_data$data[[mask_name]] <- validation_data$data[[mask_name]][, feature_indices[-1], drop = FALSE]
+      }
+      
+      cat(sprintf("%s: %d features\n", modality, length(selected_features[[modality]])))
+    }
+  }
+  
+  selected_data$features <- selected_features
+  return(selected_data)
+}
+
+
+#' Prepare validation data using exact feature matching
+#' @param model Trained model
+#' @param validation_data Validation dataset
+#' @param selected_features List of features by modality
+#' @return Validation data with exactly matched features
+prepare_validation_features <- function(model, validation_data, selected_features) {
+  selected_data <- validation_data
+
+  for (modality in names(selected_features)) {
+    if (!is.null(validation_data$data[[modality]])) {
+      feature_cols <- c("sample_id", selected_features[[modality]])
+      available_cols <- colnames(validation_data$data[[modality]])
+      missing_cols <- setdiff(feature_cols, available_cols)
+
+      if (length(missing_cols) > 0) {
+        stop(sprintf("Missing %s columns: %s",
+                    modality,
+                    paste(missing_cols[1:min(5, length(missing_cols))], collapse=", ")))
+      }
+
+      selected_data$data[[modality]] <- validation_data$data[[modality]][, feature_cols]
+      selected_data$features[[modality]] <- selected_features[[modality]]
+
+      cat(sprintf("%s: selected %d features\n", modality, length(selected_features[[modality]])))
+    }
+  }
+
+  return(selected_data)
+}
+
+
+#' Create training validation split for outer fold
+#' @param indices Vector of training indices
+#' @param validation_split Proportion for validation (between 0 and 1)
+#' @param stratify Optional stratification vector
+#' @return List containing train and validation indices
+create_train_val_split <- function(indices, validation_split, stratify = NULL) {
+  n_total <- length(indices)
+  n_val <- floor(n_total * validation_split)
+
+  if (!is.null(stratify)) {
+    # Get stratification values for these indices
+    val_indices <- create_stratified_split(indices, stratify, n_val)
+  } else {
+    # Random sampling
+    val_indices <- sample(indices, n_val)
+  }
+
+  train_indices <- setdiff(indices, val_indices)
+
+  list(
+    train = train_indices,
+    validation = val_indices
+  )
+}

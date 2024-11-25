@@ -11,17 +11,17 @@ library(tidyr)
 select_multimodal_features <- function(data, n_features, outcome_info = NULL) {
     selected_features <- list()
     
-    cat("\nFeature counts per modality:\n")
-    print(n_features)
+    #cat("\nFeature counts per modality:\n")
+    #print(n_features)
     
     # Process each modality
     for (modality in names(data)) {
         if (grepl("_mask$|_features$", modality)) next
         
-        message(sprintf("\nSelecting features for %s modality...", modality))
+        #message(sprintf("\nSelecting features for %s modality...", modality))
         
         n_features_to_select <- n_features[[modality]]
-        cat(sprintf("\nWill select %d features for %s\n", n_features_to_select, modality))
+        #cat(sprintf("\nWill select %d features for %s\n", n_features_to_select, modality))
         
         # Convert data frame to matrix, ensuring numeric conversion
         if (is.data.frame(data[[modality]])) {
@@ -50,7 +50,9 @@ select_multimodal_features <- function(data, n_features, outcome_info = NULL) {
         
         # For clinical modality, handle outcome variables
         if (modality == "clinical" && !is.null(outcome_info)) {
-            if (outcome_info$type == "survival") {
+            print(outcome_info$type)
+	    print(outcome_info$var)
+	    if (outcome_info$type == "survival") {
                 exclude_vars <- c(outcome_info$time_var, outcome_info$event_var)
             } else if (outcome_info$type == "binary") {
                 exclude_vars <- outcome_info$var
@@ -243,8 +245,8 @@ apply_feature_selection <- function(dataset, selected_features) {
             next
         }
         
-        message(sprintf("\nProcessing %s modality", modality))
-        message(sprintf("Data class: %s", class(dataset$data[[modality]])[1]))
+        #message(sprintf("\nProcessing %s modality", modality))
+        #message(sprintf("Data class: %s", class(dataset$data[[modality]])[1]))
         
         # Get feature indices (including sample_id)
         feature_cols <- c("sample_id", selected_features[[modality]])
@@ -272,9 +274,9 @@ apply_feature_selection <- function(dataset, selected_features) {
                 # Select corresponding mask columns
                 new_data[[mask_name]] <- dataset$data[[mask_name]][, mask_indices, drop=FALSE]
                 
-                message(sprintf("Selected mask for %s: %.1f%% valid values", 
-                              modality,
-                              100 * mean(new_data[[mask_name]], na.rm=TRUE)))
+                #message(sprintf("Selected mask for %s: %.1f%% valid values", 
+                #              modality,
+                #              100 * mean(new_data[[mask_name]], na.rm=TRUE)))
             }
         } else if (inherits(dataset$data[[modality]], "torch_tensor")) {
             # Handle tensor input
@@ -306,8 +308,8 @@ apply_feature_selection <- function(dataset, selected_features) {
         # Store selected feature names
         new_features[[modality]] <- selected_features[[modality]]
         
-        message(sprintf("Selected %d features for %s", 
-                       length(selected_features[[modality]]), modality))
+        #message(sprintf("Selected %d features for %s", 
+        #               length(selected_features[[modality]]), modality))
     }
     
     # Create new dataset

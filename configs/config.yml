@@ -1,0 +1,51 @@
+# config.yml
+experiment:
+  name: "multimodal_cancer_prediction"
+  seed: 42
+  output_dir: "results/experiments"
+
+cv_params:
+  outer_repeats: 2
+  outer_folds: 2
+  inner_folds: 2
+  validation_split: 0.3
+  stratify: true
+
+parallel:
+  backend: "future"
+  workers: 8
+  strategy: "multisession"
+
+model:
+  architecture:
+    modality_dims:
+      clinical: 64
+      expression: 512
+      mutations: 64
+      methylation: 512
+      mirna: 512
+      cnv: 512
+    encoder_dims:
+      clinical: [32]
+      expression: [32]
+      mutations: [32]
+      methylation: [32]
+      mirna: [32]
+      cnv: [32]
+    fusion_dim: 128
+    num_heads: 4
+    dropout: 0.1
+
+  batch_size: 32
+  max_epochs: 3
+  early_stopping:
+    patience: 10
+    min_delta: 0.001
+  optimizer:
+    name: "adam"
+    lr: 0.001
+    weight_decay: 0.0001
+  scheduler:
+    name: "reduce_on_plateau"
+    patience: 5
+    factor: 0.5
