@@ -427,16 +427,20 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
       	"\nEpoch %d/%d", epoch, config$model$max_epochs
        	))
     	message(sprintf(
-      	"Train - Loss: %.4f, Acc: %.4f, F1: %.4f",
+      	"Train - Loss: %.4f, Acc: %.4f, F1: %.4f, AUC: %.4f, Bal Acc: %.4f",
       	epoch_metrics$train_loss,
       	epoch_metrics$train_accuracy,
-      	epoch_metrics$train_f1
+      	epoch_metrics$train_f1,
+	epoch_metrics$train_auc,
+	epoch_metrics$train_balanced_accuracy
     	))
     	message(sprintf(
-      	"Val   - Loss: %.4f, Acc: %.4f, F1: %.4f",
+      	"Val - Loss: %.4f, Acc: %.4f, F1: %.4f, AUC: %.4f, Bal Acc: %.4f",
       	epoch_metrics$val_loss,
       	epoch_metrics$val_accuracy,
-      	epoch_metrics$val_f1
+      	epoch_metrics$val_f1,
+	epoch_metrics$val_auc,
+	epoch_metrics$val_balanced_accuracy
     	))
      
     	# Print class balance with safety checks
@@ -1022,12 +1026,16 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                          validation_pct = 0.3, test_pct = 0.3, 
                          seed = NULL, max_workers = 2, batch_size = 32, outcome_var=NULL) {
     
-    # Initial setup remains the same until outer fold processing
+    # Calculate memory allocation per worker
     gc()
-    
     available_memory <- as.numeric(system("free -g | awk 'NR==2 {print $4}'", intern=TRUE))
-    actual_workers <- max(1, min(max_workers, floor(available_memory / 1)))
-    message(sprintf("Using %d workers based on available memory", actual_workers))
+    memory_per_worker <- floor(available_memory / (max_workers + 1))  # Reserve some memory
+    actual_workers <- max(1, min(max_workers, floor(available_memory / 2)))
+    
+    message(sprintf("\nMemory Management Configuration:"))
+    message(sprintf("- Available memory: %d GB", available_memory))
+    message(sprintf("- Memory per worker: %d GB", memory_per_worker))
+    message(sprintf("- Using %d workers", actual_workers))
     
     message("\nVerifying initial dataset:")
     message(sprintf("- Total samples: %d", datasets$n_samples))
@@ -1073,6 +1081,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         # Process outer folds in parallel
         outer_results <- future_lapply(seq_along(repeat_split$outer_splits),
                                      function(fold_idx) {
+	    message(print(paste0("Outer fold: ",fold_idx)))
             model_copy <- model$create_copy()
             outer_split <- repeat_split$outer_splits[[fold_idx]]
 
@@ -1084,7 +1093,8 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 
             # Process inner folds to determine best hyperparameters
             inner_results <- lapply(seq_along(outer_split$inner_folds), function(inner_idx) {
-                inner_model <- model$create_copy()
+                message(print(paste0("Inner fold: ",inner_idx)))
+		inner_model <- model$create_copy()
 
                 # Create datasets for inner fold
                 inner_train_data <- subset_datasets(datasets, outer_split$inner_folds[[inner_idx]]$train_idx, batch_size)
@@ -1131,12 +1141,12 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 	    outer_val_data <- subset_datasets(datasets, outer_split$test_idx, batch_size)
 
 	    # Initialize model with best configuration
-	    model_copy <- model$create_copy()
-	    model_copy$load_state_dict(best_state_dict)
+	    outer_model <- model$create_copy()
+	    outer_model$load_state_dict(best_state_dict)
 
 	    # Train final model using best configuration from inner folds
 	    final_model <- train_model(
-    	    model = model_copy,
+    	    model = outer_model,
             train_data = outer_train_data,
             val_data = outer_val_data,
             config = config,
@@ -1174,7 +1184,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             #)
 
             # Clean up
-            rm(model_copy, actual_train_data, val_data, test_data)
+            rm(outer_model, outer_train_data, outer_val_data)
             gc()
 
             list(
@@ -1224,18 +1234,23 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         #)
     }
     final_results <- aggregate_cv_results(results)
-    #print_cv_results(final_results)
+    print_cv_results(final_results)
 
-    final_model <- select_final_model(results)
-    final_features <- select_final_features(results)
-    print(names(final_model))
-    #final_results$feature_analysis <- analyze_feature_selection()
+    # Select best performing model on validation data
+
+    performances <- sapply(results, function(r) r$best_val_loss)
+    best_repeat_idx <- which.min(performances)
+    
+    final_model <- results[[best_repeat_idx]]$best_model
+    final_features <- results[[best_repeat_idx]]$features
+    final_validation_results <- results[[best_repeat_idx]]$validation_results
     
     list(
         results = final_results,
-        final_model = final_model,
+        model = final_model,
         cv_splits = cv_splits,
-        features = final_features
+        features = final_features,
+	validation_results = final_validation_results
     )
 }
 
@@ -1508,158 +1523,6 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
 }
 
 
-#' Generate performance visualization
-#' @param results CV results
-#' @param outcome_type Either "binary" or "survival"
-#' @return List of plots
-generate_performance_visualization <- function(results, outcome_type = "binary") {
-    library(ggplot2)
-    library(tidyr)
-    library(dplyr)
-
-    plots <- list()
-
-    # Convert results to data frame
-    metrics_df <- do.call(rbind, lapply(1:length(results), function(i) {
-        iteration_results <- results[[i]]
-
-        # Extract validation metrics
-        val_metrics <- as.data.frame(t(unlist(iteration_results$validation_results$metrics)))
-        val_metrics$iteration <- i
-        val_metrics$fold <- "validation"
-
-        # Extract outer fold metrics
-        outer_metrics <- do.call(rbind, lapply(1:length(iteration_results$outer_results),
-                                             function(j) {
-            fold_metrics <- as.data.frame(t(unlist(
-                iteration_results$outer_results[[j]]$history[[
-                    length(iteration_results$outer_results[[j]]$history)
-                ]]
-            )))
-            fold_metrics$iteration <- i
-            fold_metrics$fold <- paste0("fold_", j)
-            fold_metrics
-        }))
-
-        rbind(val_metrics, outer_metrics)
-    }))
-
-    # Create performance plots based on outcome type
-    if (outcome_type == "binary") {
-        # ROC curve plot
-        plots$roc <- ggplot(metrics_df, aes(x = 1 - specificity, y = sensitivity,
-                                          color = fold)) +
-            geom_line() +
-            geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
-            theme_minimal() +
-            labs(title = "ROC Curves across CV Folds",
-                 x = "False Positive Rate",
-                 y = "True Positive Rate")
-
-        # Metrics boxplot
-        long_metrics <- metrics_df %>%
-            pivot_longer(cols = c("accuracy", "precision", "recall", "f1", "auc"),
-                        names_to = "metric", values_to = "value")
-
-        plots$metrics <- ggplot(long_metrics, aes(x = metric, y = value)) +
-            geom_boxplot() +
-            theme_minimal() +
-            labs(title = "Performance Metrics Distribution",
-                 x = "Metric", y = "Value")
-
-    } else {
-        # Kaplan-Meier curves
-        plots$km <- ggplot(metrics_df, aes(x = time, y = survival_prob,
-                                         color = risk_group)) +
-            geom_step() +
-            facet_wrap(~iteration) +
-            theme_minimal() +
-            labs(title = "Kaplan-Meier Curves by Risk Group",
-                 x = "Time", y = "Survival Probability")
-
-        # C-index distribution
-        plots$cindex <- ggplot(metrics_df, aes(x = fold, y = c_index)) +
-            geom_boxplot() +
-            theme_minimal() +
-            labs(title = "C-index Distribution across Folds",
-                 x = "Fold", y = "C-index")
-    }
-
-    plots
-}
-
-#' Save complete analysis results
-#' @param results CV results
-#' @param cancer_type Cancer type
-#' @param config Configuration
-#' @param output_dir Output directory
-
-save_analysis_results <- function(results, cancer_type, config, output_dir) {
-    dir.create(file.path(output_dir, cancer_type), recursive = TRUE, 
-              showWarnings = FALSE)
-    
-    saveRDS(results$results, 
-            file.path(output_dir, cancer_type, "performance_metrics.rds"))
-    
-    if (!is.null(results$feature_importance)) {
-        saveRDS(results$feature_importance,
-                file.path(output_dir, cancer_type, "feature_importance.rds"))
-    }
-    
-    if (!is.null(results$plots)) {
-        for (plot_name in names(results$plots)) {
-            ggsave(
-                filename = file.path(output_dir, cancer_type, 
-                                   paste0(plot_name, ".pdf")),
-                plot = results$plots[[plot_name]],
-                width = 10,
-                height = 8
-            )
-        }
-    }
-    
-    saveRDS(config, file.path(output_dir, cancer_type, "config.rds"))
-    
-    report <- generate_summary_report(results, cancer_type, config)
-    writeLines(report, file.path(output_dir, cancer_type, "summary_report.txt"))
-}
-
-#' Generate summary report
-#' @param results CV results
-#' @param cancer_type Cancer type
-#' @param config Configuration
-#' @return Text report
-generate_summary_report <- function(results, cancer_type, config) {
-    report <- c(
-        "=== Analysis Summary Report ===\n",
-        sprintf("Cancer Type: %s\n", cancer_type),
-        sprintf("Date: %s\n", Sys.Date()),
-        "\nConfiguration:",
-        sprintf("- Outcome type: %s", config$model$outcome_type),
-        sprintf("- Number of repeats: %d", config$cv_params$outer_repeats),
-        sprintf("- Number of outer folds: %d", config$cv_params$outer_folds),
-        sprintf("- Number of inner folds: %d", config$cv_params$inner_folds),
-        "\nPerformance Summary:",
-        sprintf("- Mean validation performance: %.3f", 
-                mean(results$results$validation_summary$mean)),
-        sprintf("- SD validation performance: %.3f", 
-                mean(results$results$validation_summary$sd)),
-        "\nTop Features:",
-        paste("- ", names(head(sort(results$feature_importance, decreasing = TRUE), 10)),
-              collapse = "\n"),
-        "\nModel Architecture:",
-        sprintf("- Number of parameters: %d", 
-                sum(sapply(results$final_model$parameters, function(p) prod(p$size())))),
-        "\nTraining Details:",
-        sprintf("- Best epoch: %d", 
-                which.min(results$final_model$history$val_loss)),
-        sprintf("- Final learning rate: %.6f", 
-                results$final_model$history$lr[length(results$final_model$history$lr)])
-    )
-    
-    paste(report, collapse = "\n")
-}
-
 # Check if two sets of indices have any overlap
 check_index_overlap <- function(set1, set2) {
   intersection <- intersect(set1, set2)
@@ -1842,3 +1705,41 @@ create_train_val_split <- function(indices, validation_split, stratify = NULL) {
     validation = val_indices
   )
 }
+
+analyze_feature_importance <- function(model, selected_features, top_n = 20) {
+  importance_by_modality <- list()
+
+  # Extract weights from first layer of each encoder
+  for (modality in names(model$modality_dims)) {
+    # Get first layer weights
+    weights <- model$encoders$modules[[modality]]$layers[[1]][[1]]$weight$cpu()
+    weights_matrix <- as.matrix(weights)
+
+    # Calculate importance scores (mean absolute weight)
+    importance_scores <- colMeans(abs(weights_matrix))
+
+    # Match with feature names
+    features <- selected_features[[modality]]
+    if (length(features) == length(importance_scores)) {
+      importance_df <- data.frame(
+        feature = features,
+        importance = importance_scores,
+        modality = modality
+      )
+
+      # Sort by importance
+      importance_df <- importance_df[order(-importance_df$importance), ]
+      importance_by_modality[[modality]] <- importance_df
+    }
+  }
+
+  # Print top features for each modality
+  for (modality in names(importance_by_modality)) {
+    cat(sprintf("\nTop %d %s features:\n", top_n, modality))
+    df <- head(importance_by_modality[[modality]], top_n)
+    print(df[, c("feature", "importance")])
+  }
+
+  return(importance_by_modality)
+}
+

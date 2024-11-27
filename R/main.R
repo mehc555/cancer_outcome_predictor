@@ -135,11 +135,32 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
-	max_workers = 1,      # Limit parallel workers
-        batch_size = 32,
+	max_workers = 3,      # Limit parallel workers
+        batch_size = 1300,
 	seed = NULL, # using seed defined at the top for now
 	outcome_var = "demographics_vital_status_alive"
 	)
+
+	# Usage example:
+	importance_results <- analyze_feature_importance(cv_results$model,cv_results$features)
+
+	# Optional: Create visualization
+	if (requireNamespace("ggplot2", quietly = TRUE)) {
+  	library(ggplot2)
+
+  	# Combine all modalities
+  	all_importance <- do.call(rbind, importance_results)
+
+  	# Plot top 20 features across all modalities
+  	ggplot(head(all_importance[order(-all_importance$importance), ], 20),
+        	 aes(x = reorder(feature, importance), y = importance, fill = modality)) +
+    	geom_bar(stat = "identity") +
+    	coord_flip() +
+    	theme_minimal() +
+   	 labs(x = "Feature", y = "Importance Score",
+         title = "Top 20 Most Important Features Across Modalities")
+	}
+
 
         # Save results
         results_dir <- file.path(config$main$paths$results_dir, cancer_type)

@@ -5,15 +5,15 @@ experiment:
   output_dir: "results/experiments"
 
 cv_params:
-  outer_repeats: 2
-  outer_folds: 2
-  inner_folds: 2
+  outer_repeats: 5
+  outer_folds: 5
+  inner_folds: 5
   validation_split: 0.3
   stratify: true
 
 parallel:
   backend: "future"
-  workers: 8
+  workers: 4
   strategy: "multisession"
 
 model:
@@ -37,7 +37,7 @@ model:
     dropout: 0.1
 
   batch_size: 32
-  max_epochs: 3
+  max_epochs: 25
   early_stopping:
     patience: 10
     min_delta: 0.001

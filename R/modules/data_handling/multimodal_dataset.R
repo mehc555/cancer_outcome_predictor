@@ -195,37 +195,3 @@ create_torch_datasets <- function(data_list, config, outcome_info = NULL) {
     return(dataset)
 }
 
-
-update_dimensions <- function(new_dims) {
-  # Update modality dimensions
-  self$modality_dims <- new_dims
-  
-  # Recreate encoders with new dimensions
-  encoders_dict <- list()
-  for (name in names(new_dims)) {
-    # Calculate new encoder dimensions maintaining the same ratios
-    orig_dims <- self$encoder_dims[[name]]
-    dim_ratios <- orig_dims / self$modality_dims[[name]]
-    new_encoder_dims <- ceiling(new_dims[[name]] * dim_ratios)
-    
-    # Create new encoder
-    encoders_dict[[name]] <- EnhancedModalityEncoder(
-      input_dim = new_dims[[name]],
-      hidden_dims = new_encoder_dims,
-      num_heads = self$num_heads,
-      dropout = self$dropout
-    )
-  }
-  
-  # Update encoder dictionary
-  self$encoders <- nn_module_dict(encoders_dict)
-  
-  # Update fusion module if needed
-  final_encoder_dims <- sapply(new_encoder_dims, function(x) x[length(x)])
-  self$fusion <- ModalityFusion(
-    modality_dims = final_encoder_dims,
-    fusion_dim = self$fusion_dim,
-    num_heads = self$num_heads,
-    dropout = self$dropout
-  )
-}

@@ -332,10 +332,6 @@ MultiModalSurvivalModel <- nn_module(
 )
 
 
-# Helper function for debugging
-print_tensor_info <- function(tensor, name) {
-    cat(sprintf("%s shape: %s\n", name, paste(tensor$size(), collapse=" x ")))
-}
 
 # BCE loss for binary outcomes
 compute_bce_loss <- function(predictions, targets) {
