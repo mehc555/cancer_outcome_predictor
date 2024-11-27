@@ -1103,7 +1103,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
                 # Clean up
 
     		# Prepare validation data with correct features
-		validation_data_selected <- prepare_for_evaluation(trained_model$model, inner_val_data, trained_model$selected_features)
+		validation_data_selected <- prepare_validation_features(trained_model$model, inner_val_data, trained_model$selected_features)
 		
 		# Get validation performance
 		val_results <- evaluate_model(trained_model$model, inner_val_data, outcome_type)
@@ -1147,7 +1147,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 
             # Prepare validation data with correct features
 
-            validation_data_selected <- prepare_for_evaluation(final_model$model, outer_val_data, final_model$selected_features)
+            validation_data_selected <- prepare_validation_features(final_model$model, outer_val_data, final_model$selected_features)
 	
 	    # Evaluate on the same validation set
 
@@ -1196,7 +1196,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         best_outer_val_loss <- outer_results[[best_outer_idx]]$best_val_loss
 
         # Prepare validation data with correct features
-        validation_data_selected <- prepare_for_evaluation(best_outer_model, validation_data, best_outer_features)
+        validation_data_selected <- prepare_validation_features(best_outer_model, validation_data, best_outer_features)
 
         # Now evaluate the model
         validation_results <- evaluate_model(best_outer_model, validation_data_selected, outcome_type)
@@ -1216,29 +1216,29 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             file.path(config$main$paths$results_dir, cancer_type,
                      sprintf("repeat_%d_results.rds", repeat_idx))
         )
-
-        feature_summary <- analyze_feature_selection(fold_features[[repeat_idx]])
-        saveRDS(
-            feature_summary,
-            file.path(config$main$paths$results_dir, cancer_type,
-                     sprintf("repeat_%d_feature_summary.rds", repeat_idx))
-        )
+	print("ici")
+        #feature_summary <- analyze_feature_selection(results[[repeat_idx]]$features)
+        #saveRDS(
+        #    feature_summary,
+        #    file.path(config$main$paths$results_dir, cancer_type,
+        #             sprintf("repeat_%d_feature_summary.rds", repeat_idx))
+        #)
+	print("la")
     }
-
+    print("final")
     final_results <- aggregate_cv_results(results)
     #print_cv_results(final_results)
 
     final_model <- select_final_model(results)
-    
-    final_results$feature_analysis <- analyze_feature_selection()
+    final_features <- select_final_features(results)
+    print(names(final_model))
+    #final_results$feature_analysis <- analyze_feature_selection()
     
     list(
         results = final_results,
         final_model = final_model,
         cv_splits = cv_splits,
-        raw_results = results,
-        split_validation = validation_results,
-        fold_features = fold_features
+        features = final_features
     )
 }
 
@@ -1319,6 +1319,11 @@ select_final_model <- function(results) {
     results[[best_repeat]]$best_model
 }
 
+select_final_features <- function(results) {
+    performances <- sapply(results, function(r) r$best_val_loss)
+    best_repeat <- which.min(performances)
+    results[[best_repeat]]$features
+}
 
 #' Aggregate CV results
 #' @param results List of results from all repeats
@@ -1839,44 +1844,6 @@ validate_sample_consistency <- function(datasets, cancer_type) {
     return(NULL)
   }
 
-
-#' Prepare validation data using model dimensions and selected features
-#' @param model Trained model
-#' @param validation_data Validation dataset
-#' @param selected_features List of features by modality
-#' @return Validation data with selected features
-prepare_validation_features <- function(model, validation_data, selected_features) {
-  cat("\nSelecting features for each modality:\n")
-  selected_data <- validation_data
-  
-  for (modality in names(model$modality_dims)) {
-    if (!is.null(validation_data$data[[modality]])) {
-      current_features <- validation_data$features[[modality]]
-      feature_indices <- match(selected_features[[modality]], current_features)
-      
-      if (any(is.na(feature_indices))) {
-        missing_idx <- which(is.na(feature_indices))
-        stop(sprintf("Missing %s features: %s", 
-                    modality,
-                    paste(selected_features[[modality]][missing_idx[1:min(5, length(missing_idx))]], 
-                          collapse=", ")))
-      }
-      
-      feature_indices <- c(1, feature_indices + 1)
-      selected_data$data[[modality]] <- validation_data$data[[modality]][, feature_indices, drop = FALSE]
-      
-      mask_name <- paste0(modality, "_mask")
-      if (!is.null(validation_data$data[[mask_name]])) {
-        selected_data$data[[mask_name]] <- validation_data$data[[mask_name]][, feature_indices[-1], drop = FALSE]
-      }
-      
-      cat(sprintf("%s: %d features\n", modality, length(selected_features[[modality]])))
-    }
-  }
-  
-  selected_data$features <- selected_features
-  return(selected_data)
-}
 
 
 #' Prepare validation data using exact feature matching
