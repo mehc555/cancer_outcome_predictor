@@ -1216,16 +1216,13 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             file.path(config$main$paths$results_dir, cancer_type,
                      sprintf("repeat_%d_results.rds", repeat_idx))
         )
-	print("ici")
         #feature_summary <- analyze_feature_selection(results[[repeat_idx]]$features)
         #saveRDS(
         #    feature_summary,
         #    file.path(config$main$paths$results_dir, cancer_type,
         #             sprintf("repeat_%d_feature_summary.rds", repeat_idx))
         #)
-	print("la")
     }
-    print("final")
     final_results <- aggregate_cv_results(results)
     #print_cv_results(final_results)
 
@@ -1764,62 +1761,6 @@ validate_cv_splits <- function(cv_splits) {
   )
 }
 
-#' Validate sample consistency across data modalities
-#' @param datasets MultiModalDataset or list of data files
-#' @param cancer_type Cancer type identifier
-#' @return TRUE if validation passes, stops with error if issues found
-validate_sample_consistency <- function(datasets, cancer_type) {
-    # Handle both MultiModalDataset and file path inputs
-    if (inherits(datasets, "MultiModalDataset")) {
-        # Get sample IDs from each modality
-        sample_ids <- lapply(datasets$data, function(x) {
-            if (inherits(x, "torch_tensor")) {
-                # Assuming first column is sample ID
-                as.character(x[,1]$cpu())
-            } else {
-                NULL
-            }
-        })
-
-        # Remove NULL entries and feature name lists
-        sample_ids <- sample_ids[!sapply(sample_ids, is.null)]
-        sample_ids <- sample_ids[!grepl("_features$", names(sample_ids))]
-
-    } else if (is.list(datasets) && all(sapply(datasets, is.character))) {
-        # Handle file path input
-        sample_ids <- lapply(datasets, function(file) {
-            if (file.exists(file)) {
-                df <- read.delim(file, nrows = 1)
-                if ("sample_id" %in% colnames(df) || "Sample_ID" %in% colnames(df)) {
-                    read.delim(file)[,1]
-                } else {
-                    NULL
-                }
-            } else {
-                NULL
-            }
-        })
-    } else {
-        stop("Invalid input type for datasets")
-    }
-
-    # Perform consistency checks
-    sample_ids <- sample_ids[!sapply(sample_ids, is.null)]
-    if (length(sample_ids) == 0) {
-        stop("No valid sample IDs found in any modality")
-    }
-
-    # Check for consistency across modalities
-    reference_samples <- sample_ids[[1]]
-    for (modality in names(sample_ids)[-1]) {
-        if (!identical(sort(reference_samples), sort(sample_ids[[modality]]))) {
-            stop(sprintf("Sample mismatch in %s modality for %s",
-                        modality, cancer_type))
-        }
-    }
-
-    return(TRUE)
-}
 
 # Function to safely calculate mean
   safe_mean <- function(x) {

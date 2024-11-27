@@ -1,6 +1,6 @@
 # R/main.R
 
-options(future.globals.maxSize = 12000 * 1024^2
+options(future.globals.maxSize = 12000 * 1024^2)
 
 # Source base setup
 source("R/setup.R")
@@ -99,6 +99,7 @@ main <- function(download=FALSE) {
 
         # Outcome information
 
+
         outcome_info <- list(
  	type = "binary",
   	var = "demographics_vital_status_alive"
@@ -116,7 +117,6 @@ main <- function(download=FALSE) {
             config$model,
 	    outcome_info = outcome_info
         )
-	save.rds(torch_datasets,"torch_datasets.rds")
 
 	# Initialize model
 	model <- MultiModalSurvivalModel(
@@ -154,7 +154,7 @@ main <- function(download=FALSE) {
         logger::log_info("Completed processing for cancer type: {cancer_type}")
     }
     
-    return(processed_data)
+    #return(processed_data)
 }
 
 main()
