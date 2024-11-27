@@ -152,7 +152,7 @@ main <- function(download=FALSE) {
   	all_importance <- do.call(rbind, importance_results)
 
   	# Plot top 20 features across all modalities
-  	ggplot(head(all_importance[order(-all_importance$importance), ], 20),
+  	ggplot(head(all_importance[order(-all_importance$importance), ], 50),
         	 aes(x = reorder(feature, importance), y = importance, fill = modality)) +
     	geom_bar(stat = "identity") +
     	coord_flip() +
