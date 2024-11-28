@@ -5,9 +5,9 @@ experiment:
   output_dir: "results/experiments"
 
 cv_params:
-  outer_repeats: 5
-  outer_folds: 5
-  inner_folds: 5
+  outer_repeats: 2
+  outer_folds: 2
+  inner_folds: 2
   validation_split: 0.3
   stratify: true
 
@@ -19,12 +19,12 @@ parallel:
 model:
   architecture:
     modality_dims:
-      clinical: 64
-      expression: 512
-      mutations: 64
-      methylation: 512
-      mirna: 512
-      cnv: 512
+      clinical: 32     # Reduced from 64
+      expression: 256  # Reduced from 512
+      mutations: 32    # Reduced from 64
+      methylation: 256 # Reduced from 512
+      mirna: 256      # Reduced from 512
+      cnv: 256        # Reduced from 512
     encoder_dims:
       clinical: [32]
       expression: [32]
@@ -32,12 +32,12 @@ model:
       methylation: [32]
       mirna: [32]
       cnv: [32]
-    fusion_dim: 128
+    fusion_dim: 64
     num_heads: 4
-    dropout: 0.1
+    dropout: 0.2
 
   batch_size: 32
-  max_epochs: 25
+  max_epochs: 5
   early_stopping:
     patience: 10
     min_delta: 0.001

@@ -6,8 +6,6 @@ library(progressr)
 library(survival)
 library(glmnet)
 
-
-
 #' Extract stratification variable from datasets
 #' @param datasets Torch MultiModalDataset or list
 #' @param outcome_type Either "binary" or "survival"
@@ -424,9 +422,9 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
     
      if (epoch %% print_every == 0) {
     	message(sprintf(
-      	"\nEpoch %d/%d", epoch, config$model$max_epochs
+      	"Epoch %d/%d", epoch, config$model$max_epochs
        	))
-    	message(sprintf(
+    	cat(sprintf(
       	"Train - Loss: %.4f, Acc: %.4f, F1: %.4f, AUC: %.4f, Bal Acc: %.4f",
       	epoch_metrics$train_loss,
       	epoch_metrics$train_accuracy,
@@ -434,7 +432,7 @@ train_model <- function(model, train_data, val_data, config, outcome_type = "bin
 	epoch_metrics$train_auc,
 	epoch_metrics$train_balanced_accuracy
     	))
-    	message(sprintf(
+    	cat(sprintf(
       	"Val - Loss: %.4f, Acc: %.4f, F1: %.4f, AUC: %.4f, Bal Acc: %.4f",
       	epoch_metrics$val_loss,
       	epoch_metrics$val_accuracy,
@@ -1073,7 +1071,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     
 
         # Process each repeat
-    for (repeat_idx in 1:2) {
+    for (repeat_idx in 1:config$cv_params$outer_repeats) {
         message(sprintf("Processing repeat %d/%d", repeat_idx, length(cv_splits)))
         repeat_split <- cv_splits[[repeat_idx]]
         fold_features[[repeat_idx]] <- list()
@@ -1081,7 +1079,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         # Process outer folds in parallel
         outer_results <- future_lapply(seq_along(repeat_split$outer_splits),
                                      function(fold_idx) {
-	    message(print(paste0("Outer fold: ",fold_idx)))
+	    cat(paste0("Outer fold: ",fold_idx))
             model_copy <- model$create_copy()
             outer_split <- repeat_split$outer_splits[[fold_idx]]
 
@@ -1093,7 +1091,7 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 
             # Process inner folds to determine best hyperparameters
             inner_results <- lapply(seq_along(outer_split$inner_folds), function(inner_idx) {
-                message(print(paste0("Inner fold: ",inner_idx)))
+                cat(paste0("Inner fold: ",inner_idx))
 		inner_model <- model$create_copy()
 
                 # Create datasets for inner fold
