@@ -927,8 +927,8 @@ process_inner_folds <- function(inner_folds, model, datasets, config, params) {
 #' @param config Model configuration
 #' @param params Additional parameters
 #' @return List of outer fold results
-process_outer_fold <- function(fold_idx, fold_data, model, datasets, config, params) {
-    message(sprintf("Processing outer fold: %d", fold_idx))
+process_outer_fold <- function(outer_fold_idx, fold_data, model, datasets, config, params) {
+    message(sprintf("Processing outer fold: %d", outer_fold_idx))
     
     # Process inner folds
     inner_results <- process_inner_folds(
@@ -1027,10 +1027,10 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         # Process outer folds in parallel
         outer_results <- future_lapply(
             seq_along(cv_splits[[repeat_idx]]$outer_splits),
-            function(fold_idx) {
+            function(outer_fold_idx) {
                 process_outer_fold(
-                    fold_idx,
-                    cv_splits[[repeat_idx]]$outer_splits[[fold_idx]],
+                    outer_fold_idx,
+                    cv_splits[[repeat_idx]]$outer_splits[[outer_fold_idx]],
                     model,
                     datasets,
                     config,
@@ -1592,3 +1592,275 @@ analyze_feature_importance <- function(model, selected_features, top_n = 20) {
   return(importance_by_modality)
 }
 
+# Helper function to extract attention weights
+extract_attention_weights <- function(model, data_batch) {
+  weights <- list()
+
+  # Extract intra-modality attention weights
+  intra_attention <- list()
+  for (modality in names(model$encoders$modules)) {
+    if (!is.null(model$encoders$modules[[modality]]$attention)) {
+      output <- model$encoders$modules[[modality]]$attention(data_batch$data[[modality]])
+      intra_attention[[modality]] <- output$attention_weights$detach()$cpu()
+    }
+  }
+  weights$intra_modality <- intra_attention
+
+  # Extract cross-modality attention weights
+  if (!is.null(model$fusion$cross_attention)) {
+    cross_attention <- list()
+    for (module_name in names(model$fusion$cross_attention$modules)) {
+      parts <- strsplit(module_name, "_to_")[[1]]
+      query_modality <- parts[1]
+      key_modality <- parts[2]
+
+      output <- model$fusion$cross_attention$modules[[module_name]](
+        data_batch$data[[query_modality]],
+        data_batch$data[[key_modality]],
+        data_batch$data[[key_modality]]
+      )
+      cross_attention[[module_name]] <- output$attention_weights$detach()$cpu()
+    }
+    weights$cross_modality <- cross_attention
+  }
+
+  # Extract global attention weights
+  if (!is.null(model$fusion$global_attention)) {
+    output <- model$fusion$forward(data_batch$data)
+    weights$global <- output$attention_weights$detach()$cpu()
+  }
+
+  return(weights)
+}
+
+# Function to analyze attention patterns
+analyze_attention_patterns <- function(cv_results, datasets, batch_size = 32) {
+  model <- cv_results$model
+  features <- cv_results$features
+
+  # Create dataloader
+  loader <- dataloader(
+    dataset = datasets,
+    batch_size = batch_size,
+    shuffle = FALSE,
+    collate_fn = custom_collate
+  )
+
+  # Collect attention weights for all batches
+  all_weights <- list()
+  model$eval()
+
+  with_no_grad({
+    coro::loop(for (batch in loader) {
+      batch_weights <- extract_attention_weights(model, batch)
+
+      # Accumulate weights
+      if (length(all_weights) == 0) {
+        all_weights <- batch_weights
+      } else {
+        # Combine weights across batches
+        for (level in names(batch_weights)) {
+          if (level == "intra_modality") {
+            for (modality in names(batch_weights[[level]])) {
+              all_weights[[level]][[modality]] <- torch_cat(
+                list(all_weights[[level]][[modality]],
+                     batch_weights[[level]][[modality]]),
+                dim = 1
+              )
+            }
+          } else if (level == "cross_modality") {
+            for (pair in names(batch_weights[[level]])) {
+              all_weights[[level]][[pair]] <- torch_cat(
+                list(all_weights[[level]][[pair]],
+                     batch_weights[[level]][[pair]]),
+                dim = 1
+              )
+            }
+          } else if (level == "global") {
+            all_weights[[level]] <- torch_cat(
+              list(all_weights[[level]], batch_weights[[level]]),
+              dim = 1
+            )
+          }
+        }
+      }
+    })
+  })
+
+  # Calculate average attention weights
+  avg_weights <- list()
+
+  # Average intra-modality weights
+  if (!is.null(all_weights$intra_modality)) {
+    avg_weights$intra_modality <- lapply(all_weights$intra_modality, function(w) {
+      w$mean(dim = 1)$numpy()
+    })
+  }
+
+  # Average cross-modality weights
+  if (!is.null(all_weights$cross_modality)) {
+    avg_weights$cross_modality <- lapply(all_weights$cross_modality, function(w) {
+      w$mean(dim = 1)$numpy()
+    })
+  }
+
+  # Average global weights
+  if (!is.null(all_weights$global)) {
+    avg_weights$global <- all_weights$global$mean(dim = 1)$numpy()
+  }
+
+  return(list(
+    weights = avg_weights,
+    features = features
+  ))
+}
+
+# Function to visualize attention patterns
+visualize_attention_patterns <- function(attention_results) {
+  plots <- list()
+
+  # Visualize intra-modality attention
+  if (!is.null(attention_results$weights$intra_modality)) {
+    for (modality in names(attention_results$weights$intra_modality)) {
+      weights <- attention_results$weights$intra_modality[[modality]]
+      features <- attention_results$features[[modality]]
+
+      # Create data frame for plotting
+      df <- expand.grid(
+        Feature1 = features,
+        Feature2 = features
+      )
+      df$Weight <- as.vector(weights)
+
+      # Create heatmap
+      p <- ggplot(df, aes(Feature1, Feature2, fill = Weight)) +
+        geom_tile() +
+        scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                           midpoint = mean(df$Weight)) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = paste("Intra-modality Attention:", modality),
+             x = "Feature", y = "Feature")
+
+      plots[[paste0("intra_", modality)]] <- p
+    }
+  }
+
+  # Visualize cross-modality attention
+  if (!is.null(attention_results$weights$cross_modality)) {
+    for (pair in names(attention_results$weights$cross_modality)) {
+      parts <- strsplit(pair, "_to_")[[1]]
+      query_modality <- parts[1]
+      key_modality <- parts[2]
+
+      weights <- attention_results$weights$cross_modality[[pair]]
+      query_features <- attention_results$features[[query_modality]]
+      key_features <- attention_results$features[[key_modality]]
+
+      # Create data frame for plotting
+      df <- expand.grid(
+        Query = query_features,
+        Key = key_features
+      )
+      df$Weight <- as.vector(weights)
+
+      # Create heatmap
+      p <- ggplot(df, aes(Query, Key, fill = Weight)) +
+        geom_tile() +
+        scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                           midpoint = mean(df$Weight)) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(title = paste("Cross-modality Attention:", pair),
+             x = query_modality, y = key_modality)
+
+      plots[[paste0("cross_", pair)]] <- p
+    }
+  }
+
+  # Visualize global attention
+  if (!is.null(attention_results$weights$global)) {
+    # Combine all features
+    all_features <- unlist(attention_results$features)
+    weights <- attention_results$weights$global
+
+    df <- expand.grid(
+      Feature1 = all_features,
+      Feature2 = all_features
+    )
+    df$Weight <- as.vector(weights)
+
+    p <- ggplot(df, aes(Feature1, Feature2, fill = Weight)) +
+      geom_tile() +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = mean(df$Weight)) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Global Attention Patterns",
+           x = "Feature", y = "Feature")
+
+    plots$global <- p
+  }
+
+  return(plots)
+}
+
+# Function to summarize attention patterns
+summarize_attention_patterns <- function(attention_results) {
+  summary <- list()
+
+  # Summarize intra-modality attention
+  if (!is.null(attention_results$weights$intra_modality)) {
+    intra_summary <- lapply(names(attention_results$weights$intra_modality), function(modality) {
+      weights <- attention_results$weights$intra_modality[[modality]]
+      features <- attention_results$features[[modality]]
+
+      # Calculate feature importance based on attention
+      importance <- rowSums(weights)
+      top_features <- features[order(importance, decreasing = TRUE)][1:10]
+
+      list(
+        modality = modality,
+        top_features = top_features,
+        importance_scores = sort(importance, decreasing = TRUE)[1:10]
+      )
+    })
+    names(intra_summary) <- names(attention_results$weights$intra_modality)
+    summary$intra_modality <- intra_summary
+  }
+
+  # Summarize cross-modality attention
+  if (!is.null(attention_results$weights$cross_modality)) {
+    cross_summary <- lapply(names(attention_results$weights$cross_modality), function(pair) {
+      weights <- attention_results$weights$cross_modality[[pair]]
+      parts <- strsplit(pair, "_to_")[[1]]
+
+      # Calculate modality interaction strength
+      interaction_strength <- mean(weights)
+
+      list(
+        pair = pair,
+        interaction_strength = interaction_strength
+      )
+    })
+    names(cross_summary) <- names(attention_results$weights$cross_modality)
+    summary$cross_modality <- cross_summary
+  }
+
+  # Summarize global attention
+  if (!is.null(attention_results$weights$global)) {
+    weights <- attention_results$weights$global
+    all_features <- unlist(attention_results$features)
+
+    # Calculate global feature importance
+    importance <- rowSums(weights)
+    top_features <- all_features[order(importance, decreasing = TRUE)][1:10]
+
+    summary$global <- list(
+      top_features = top_features,
+      importance_scores = sort(importance, decreasing = TRUE)[1:10]
+    )
+  }
+
+  return(summary)
+}

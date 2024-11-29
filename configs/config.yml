@@ -19,13 +19,14 @@ parallel:
 model:
   print_every: 1
   architecture:
+    dropout: 0.2
     modality_dims:
-      clinical: 32     # Reduced from 64
-      expression: 256  # Reduced from 512
-      mutations: 32    # Reduced from 64
-      methylation: 256 # Reduced from 512
-      mirna: 256      # Reduced from 512
-      cnv: 256        # Reduced from 512
+      clinical: 32     
+      expression: 256  
+      mutations: 32    
+      methylation: 256 
+      mirna: 256      
+      cnv: 256        
     encoder_dims:
       clinical: [32]
       expression: [32]
@@ -34,9 +35,22 @@ model:
       mirna: [32]
       cnv: [32]
     fusion_dim: 64
-    num_heads: 4
-    dropout: 0.2
+    attention:
+      intra_modality:  # New section for intra-modality attention
+        enabled: true
+        num_heads: 2
+        dropout: 0.1
+        pre_norm: true  # Whether to use pre-norm or post-norm
+      cross_modality:   # New cross-attention config
+        enabled: true
+        num_heads: 2
+        dropout: 0.1
+      global:          # Attention after fusion
+        enabled: true
+        num_heads: 2
+        dropout: 0.1      
 
+  # Rest of the config remains the same
   batch_size: 32
   max_epochs: 2
   early_stopping:

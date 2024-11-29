@@ -160,7 +160,23 @@ main <- function(download=FALSE) {
    	 labs(x = "Feature", y = "Importance Score",
          title = "Top 20 Most Important Features Across Modalities")
 	}
+	
 
+	# Now also analyze attention patterns
+	attention_results <- analyze_attention_patterns(cv_results, datasets)
+
+	# Create visualizations
+	attention_plots <- visualize_attention_patterns(attention_results)
+
+	# Get attention pattern summary
+	attention_summary <- summarize_attention_patterns(attention_results)
+
+	# Display plots
+	library(gridExtra)
+	do.call(grid.arrange, c(attention_plots, ncol=2))
+
+	# Print summary
+	print(attention_summary)
 
         # Save results
         results_dir <- file.path(config$main$paths$results_dir, cancer_type)
