@@ -1,7 +1,7 @@
 # config.yml
 experiment:
   name: "multimodal_cancer_prediction"
-  seed: 42
+  seed: 123
   output_dir: "results/experiments"
 
 cv_params:
@@ -52,7 +52,7 @@ model:
 
   # Rest of the config remains the same
   batch_size: 32
-  max_epochs: 2
+  max_epochs: 1
   early_stopping:
     patience: 10
     min_delta: 0.001

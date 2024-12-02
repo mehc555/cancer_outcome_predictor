@@ -1,5 +1,6 @@
 # R/main.R
 
+library(ggplot2)
 options(future.globals.maxSize = 12000 * 1024^2)
 
 # Source base setup
@@ -18,8 +19,21 @@ source("R/modules/helper_functions/misc.R")
 source("R/modules/models/torch_models.R")
 source("R/modules/training/cv_engine.R")
 source("R/modules/training/feature_selection.R")
-set.seed(123)
 
+seed=123
+set.seed(seed)
+
+# Set torch seed
+torch::torch_manual_seed(seed)
+
+# Set CUDA seed if available
+if (torch::cuda_is_available()) {
+  torch::cuda_manual_seed_all(seed)
+}
+
+
+# Set parallel backend seed
+future::plan(future::multisession, future.seed=TRUE)
 
 main <- function(download=FALSE) {
     # Initialize project and load config
@@ -140,16 +154,26 @@ main <- function(download=FALSE) {
 	seed = NULL, # using seed defined at the top for now
 	outcome_var = "demographics_vital_status_alive"
 	)
-
-	# Usage example:
-	importance_results <- analyze_feature_importance(cv_results$model,cv_results$features)
-
-	# Optional: Create visualization
-	if (requireNamespace("ggplot2", quietly = TRUE)) {
-  	library(ggplot2)
+	
+	  # Validate features immediately after CV
+  	  validate_features(cv_results)
+  
+  	# Analyze feature importance
+  	importance_results <- analyze_feature_importance(cv_results$model, cv_results$features)
+  
+  	# Analyze attention patterns
+  	attention_results <- analyze_attention_patterns(cv_results)
+  
+  	# Create visualizations
+  	attention_plots <- visualize_attention_patterns(attention_results)
+  
+  	# Get attention pattern summary
+  	attention_summary <- summarize_attention_patterns(attention_results, cv_results)
 
   	# Combine all modalities
   	all_importance <- do.call(rbind, importance_results)
+	
+	print_attention_summary(attention_summary)
 
   	# Plot top 20 features across all modalities
   	ggplot(head(all_importance[order(-all_importance$importance), ], 50),
@@ -159,24 +183,9 @@ main <- function(download=FALSE) {
     	theme_minimal() +
    	 labs(x = "Feature", y = "Importance Score",
          title = "Top 20 Most Important Features Across Modalities")
-	}
 	
-
-	# Now also analyze attention patterns
-	attention_results <- analyze_attention_patterns(cv_results, datasets)
-
-	# Create visualizations
-	attention_plots <- visualize_attention_patterns(attention_results)
-
-	# Get attention pattern summary
-	attention_summary <- summarize_attention_patterns(attention_results)
-
-	# Display plots
-	library(gridExtra)
-	do.call(grid.arrange, c(attention_plots, ncol=2))
-
-	# Print summary
-	print(attention_summary)
+	
+    	create_attention_visualizations(attention_results, cv_results)
 
         # Save results
         results_dir <- file.path(config$main$paths$results_dir, cancer_type)
