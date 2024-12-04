@@ -1,7 +1,6 @@
 # config.yml
 experiment:
   name: "multimodal_cancer_prediction"
-  seed: 123
   output_dir: "results/experiments"
 
 cv_params:
@@ -21,9 +20,9 @@ model:
   architecture:
     dropout: 0.2
     modality_dims:
-      clinical: 32     
+      clinical: 64     
       expression: 256  
-      mutations: 32    
+      mutations: 64    
       methylation: 256 
       mirna: 256      
       cnv: 256        
@@ -52,7 +51,7 @@ model:
 
   # Rest of the config remains the same
   batch_size: 32
-  max_epochs: 1
+  max_epochs: 2
   early_stopping:
     patience: 10
     min_delta: 0.001

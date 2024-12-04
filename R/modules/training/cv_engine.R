@@ -129,85 +129,6 @@ custom_collate <- function(batch) {
 }
 
 
-# Updated inspect batch function to also show features
-inspect_batch <- function(batch, verbose = TRUE) {
-  if (verbose) cat("\n=== Inspecting Batch Structure ===\n")
-  
-  # Check basic batch structure
-  cat("\nBatch components:", paste(names(batch), collapse=", "), "\n")
-  
-  # Inspect data tensors
-  if (!is.null(batch$data)) {
-    cat("\nData modalities:", paste(names(batch$data), collapse=", "), "\n")
-    for (modality in names(batch$data)) {
-      if (inherits(batch$data[[modality]], "torch_tensor")) {
-        cat(sprintf("\n%s tensor shape: %s", 
-                   modality, 
-                   paste(batch$data[[modality]]$size(), collapse=" x ")))
-        cat(sprintf("\n%s tensor type: %s", 
-                   modality, 
-                   batch$data[[modality]]$dtype))
-        
-        # Show first few feature names if available
-        feature_name <- paste0(modality, "_features")
-        if (!is.null(batch[[feature_name]])) {
-          cat(sprintf("\n%s first features: %s", 
-                     modality,
-                     paste(head(batch[[feature_name]], 3), collapse=", ")))
-        }
-      } else {
-        cat(sprintf("\nWarning: %s is not a tensor! Class: %s", 
-                   modality, 
-                   class(batch$data[[modality]])))
-      }
-    }
-  }
-  
-  # Inspect masks
-  if (!is.null(batch$masks)) {
-    cat("\n\nMask modalities:", paste(names(batch$masks), collapse=", "), "\n")
-    for (modality in names(batch$masks)) {
-      if (inherits(batch$masks[[modality]], "torch_tensor")) {
-        cat(sprintf("\n%s mask shape: %s", 
-                   modality, 
-                   paste(batch$masks[[modality]]$size(), collapse=" x ")))
-      } else {
-        cat(sprintf("\nWarning: %s mask is not a tensor! Class: %s", 
-                   modality, 
-                   class(batch$masks[[modality]])))
-      }
-    }
-  }
-  
-  # Show available features if present
-  if (!is.null(batch$features)) {
-    cat("\n\nFeature information available for modalities:", 
-        paste(names(batch$features), collapse=", "))
-  }
-  
-  # Return TRUE if everything is tensors, FALSE otherwise
-  all_tensors <- TRUE
-  
-  # Check data tensors
-  if (!is.null(batch$data)) {
-    for (modality in names(batch$data)) {
-      if (!inherits(batch$data[[modality]], "torch_tensor")) {
-        all_tensors <- FALSE
-      }
-    }
-  }
-  
-  # Check masks
-  if (!is.null(batch$masks)) {
-    for (modality in names(batch$masks)) {
-      if (!inherits(batch$masks[[modality]], "torch_tensor")) {
-        all_tensors <- FALSE
-      }
-    }
-  }
-  
-  return(all_tensors)
-}
 
 #' Train model with multi-modal data and feature selection
 #' @param model Neural network model
@@ -218,28 +139,19 @@ inspect_batch <- function(batch, verbose = TRUE) {
 #' @return Trained model, training history, and selected features
 
 train_model <- function(model, train_data, config, outcome_type = "binary", outcome_var = NULL, selected_features = NULL) {
-    # Feature selection remains the same
-    if (is.null(selected_features)) {
-        message("Performing feature selection on training data...")
-        selected_features <- select_multimodal_features(
-            train_data$data,
-            n_features = list(
-                cnv = config$model$architecture$modality_dims$cnv,
-                clinical = config$model$architecture$modality_dims$clinical,
-                expression = config$model$architecture$modality_dims$expression,
-                mutations = config$model$architecture$modality_dims$mutations,
-                methylation = config$model$architecture$modality_dims$methylation,
-                mirna = config$model$architecture$modality_dims$mirna
-            ),
-            outcome_info = list(
-                type = "binary",
-                var = outcome_var
-            )
-        )
-    }
-
+  if (is.null(selected_features)) {
+    message("Performing feature selection on training data...")
+    selected_features <- select_multimodal_features(
+      train_data$data,
+      n_features = config$model$architecture$modality_dims,
+      outcome_info = list(
+        type = outcome_type,
+        var = outcome_var
+      )
+    )
+   }
     train_data_selected <- apply_feature_selection(train_data, selected_features)
-    
+  
     train_loader <- dataloader(
         dataset = train_data_selected,
         batch_size = config$model$batch_size,
@@ -331,7 +243,8 @@ train_model <- function(model, train_data, config, outcome_type = "binary", outc
         model = model,
         history = training_history,
         best_loss = best_loss,
-        selected_features = selected_features
+        selected_features = selected_features,
+    	config = config
     )
 }
 
@@ -734,20 +647,20 @@ create_stratified_folds <- function(train_indices, stratify, n_folds, test_pct =
 #' @return Subsetted MultiModalDataset
 
 subset_datasets <- function(datasets, indices, batch_size = 32) {
-    cat("1. Starting dataset subsetting\n")
+    #cat("1. Starting dataset subsetting\n")
     
     if (!inherits(datasets, "MultiModalDataset")) {
         stop("datasets must be a MultiModalDataset object")
     }
     
-    cat("2. Creating new data list\n")
+    #cat("2. Creating new data list\n")
     subsetted_data <- list()
     
-    cat("3. Processing data and masks for each modality\n")
+    #cat("3. Processing data and masks for each modality\n")
     modalities <- c("clinical", "cnv", "expression", "mutations", "methylation", "mirna")
     for (modality in modalities) {
         if (!is.null(datasets$data[[modality]])) {
-            cat(sprintf("   - Processing %s\n", modality))
+            #cat(sprintf("   - Processing %s\n", modality))
             
             # Subset data
             subsetted_data[[modality]] <- datasets$data[[modality]][indices, , drop = FALSE]
@@ -763,7 +676,7 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
         }
     }
     
-    cat("4. Processing outcomes if present\n")
+    #cat("4. Processing outcomes if present\n")
     # Handle outcomes
     subsetted_outcomes <- NULL
     if (!is.null(datasets$outcomes)) {
@@ -776,7 +689,7 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
         }
     }
     
-    cat("5. Creating new dataset\n")
+    #cat("5. Creating new dataset\n")
     new_dataset <- dataset(
         name = "MultiModalDataset",
         initialize = function() {
@@ -888,6 +801,7 @@ setup_parallel_env <- function(max_workers) {
 #' @param config Model configuration
 #' @param params Additional parameters
 #' @return List of inner fold results
+
 process_inner_folds <- function(inner_folds, model, datasets, config, params) {
     lapply(seq_along(inner_folds), function(inner_idx) {
         message(sprintf("Processing inner fold: %d", inner_idx))
@@ -912,7 +826,6 @@ process_inner_folds <- function(inner_folds, model, datasets, config, params) {
             inner_val_data, 
             trained_model$selected_features
         )
-        #val_results <- evaluate_model(trained_model$model, inner_val_data, params$outcome_type)
         val_results <- evaluate_model(trained_model$model, val_data_selected, params$outcome_type)
 
         # Cleanup
@@ -940,7 +853,7 @@ process_outer_fold <- function(outer_fold_idx, fold_data, model, datasets, confi
     message(sprintf("Processing outer fold: %d", outer_fold_idx))
     
     # Process inner folds
-    inner_results <- process_inner_folds(
+    inner_results <- process_inner_folds_with_hpo(
         fold_data$inner_folds, 
         model, 
         datasets, 
@@ -985,7 +898,8 @@ process_outer_fold <- function(outer_fold_idx, fold_data, model, datasets, confi
         state_dict = final_model$model$state_dict(),
         val_metrics = test_results$metrics,
         selected_features = final_model$selected_features,
-        best_loss = final_model$best_loss
+	best_loss = final_model$best_loss,
+    	best_config = best_config$config
     )
 }
 
@@ -1071,12 +985,11 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
             validation_results = validation_results,
             best_model = best_outer_model$model,
             features = best_outer_model$selected_features,
-            best_loss = best_outer_model$best_loss
-        )
+            best_loss = best_outer_model$best_loss,
+            validation_data = validation_data_selected
+	)
                 
     }
-
-
 
     # Aggregate and summarize results
     final_results <- aggregate_cv_results(results)
@@ -1090,7 +1003,8 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
         cv_splits = cv_splits,
         features = results[[best_repeat_idx]]$features,
         validation_results = results[[best_repeat_idx]]$validation_results,
-        best_loss = results[[best_repeat_idx]]$best_loss
+        best_loss = results[[best_repeat_idx]]$best_loss,
+    	validation_data = results[[best_repeat_idx]]$validation_data
     )
     
     # Create results directory if it doesn't exist
@@ -1101,12 +1015,12 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     }
     
     # Save only the best model results
-    saveRDS(
-        best_model_results,
-        file.path(results_dir, "best_model_results.rds")
-    )
-    message(sprintf("Saved best model results to: %s", 
-                   file.path(results_dir, "best_model_results.rds")))
+    #saveRDS(
+    #    best_model_results,
+    #    file.path(results_dir, "best_model_results.rds")
+    #)
+    #message(sprintf("Saved best model results to: %s", 
+    #               file.path(results_dir, "best_model_results.rds")))
     
     return(best_model_results)
 }

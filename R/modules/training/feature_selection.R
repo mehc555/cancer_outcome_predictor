@@ -90,8 +90,8 @@ select_multimodal_features <- function(data, n_features, outcome_info = NULL) {
             selected_features[[modality]] <- selected
             
             if (!is.null(selected)) {
-                message(sprintf("Selected %d features for %s", 
-                              length(selected), modality))
+                #message(sprintf("Selected %d features for %s", 
+                              #length(selected), modality))
             }
         }
     }

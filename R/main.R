@@ -133,12 +133,16 @@ main <- function(download=FALSE) {
         )
 
 	# Initialize model
+	
+
 	model <- MultiModalSurvivalModel(
-    	modality_dims = config$model$architecture$modality_dims,
-    	encoder_dims = config$model$architecture$encoder_dims,
-    	fusion_dim = config$model$architecture$fusion_dim,
-    	dropout = config$model$architecture$dropout
-	)
+	  modality_dims = config$model$architecture$modality_dims,
+	  encoder_dims = config$model$architecture$encoder_dims,
+	  fusion_dim = config$model$architecture$fusion_dim,
+	  dropout = config$model$architecture$dropout,
+	  attention_config = config$model$architecture$attention
+        )
+
 
 	# Run nested cross-validation with repeated validation sets
 	message("\nStarting nested cross-validation...")
@@ -149,9 +153,9 @@ main <- function(download=FALSE) {
     	cancer_type = cancer_type,
         validation_pct = 0.3,
 	test_pct = 0.3,
-	max_workers = 3,      # Limit parallel workers
-        batch_size = 1300,
-	seed = NULL, # using seed defined at the top for now
+	max_workers = 1,      # Limit parallel workers
+        batch_size = 256,
+	seed = seed, # using seed defined at the top for now
 	outcome_var = "demographics_vital_status_alive"
 	)
 	
