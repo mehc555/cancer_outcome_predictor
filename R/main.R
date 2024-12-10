@@ -19,10 +19,10 @@ source("R/modules/helper_functions/misc.R")
 source("R/modules/models/torch_models.R")
 source("R/modules/training/cv_engine.R")
 source("R/modules/training/feature_selection.R")
-
+source("R/modules/training/hyperparameter_optimization.R")
 seed=123
 set.seed(seed)
-
+  
 # Set torch seed
 torch::torch_manual_seed(seed)
 
@@ -34,6 +34,7 @@ if (torch::cuda_is_available()) {
 
 # Set parallel backend seed
 future::plan(future::multisession, future.seed=TRUE)
+
 
 main <- function(download=FALSE) {
     # Initialize project and load config
@@ -144,23 +145,24 @@ main <- function(download=FALSE) {
         )
 
 
-	# Run nested cross-validation with repeated validation sets
-	message("\nStarting nested cross-validation...")
-	cv_results <- run_nested_cv(
-    	model = model,  # Add this line
-    	datasets = torch_datasets,
-    	config = config,
-    	cancer_type = cancer_type,
+
+        # Run nested cross-validation with repeated validation sets
+        message("\nStarting nested cross-validation...")
+        cv_results <- run_nested_cv(
+        model = model,  # Add this line
+        datasets = torch_datasets,
+        config = config,
+        cancer_type = cancer_type,
         validation_pct = 0.3,
-	test_pct = 0.3,
-	max_workers = 1,      # Limit parallel workers
-        batch_size = 256,
-	seed = seed, # using seed defined at the top for now
-	outcome_var = "demographics_vital_status_alive"
+        test_pct = 0.3,
+        max_workers = 1,      # Limit parallel workers
+        batch_size = 32,
+        seed = seed,
+        outcome_var=outcome_info$var
 	)
-	
-	  # Validate features immediately after CV
-  	  validate_features(cv_results)
+
+        # Validate features immediately after CV
+  	validate_features(cv_results)
   
   	# Analyze feature importance
   	importance_results <- analyze_feature_importance(cv_results$model, cv_results$features)

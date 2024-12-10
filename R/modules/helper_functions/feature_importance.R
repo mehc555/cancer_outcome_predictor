@@ -376,46 +376,6 @@ summarize_attention_patterns <- function(attention_results, cv_results) {
   return(summary)
 }
 
-# Print summary function
-print_attention_summary <- function(summary) {
-  if (!is.null(summary$intra_modality)) {
-    cat("\n=== Intra-Modality Attention Patterns ===\n")
-    for (modality in names(summary$intra_modality)) {
-      cat(sprintf("\n%s Top Features:\n", toupper(modality)))
-      results <- summary$intra_modality[[modality]]
-      if (!is.null(results)) {
-        for (i in seq_along(results$features)) {
-          cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                     i, results$features[i], results$scores[i]))
-        }
-      }
-    }
-  }
-  
-  if (!is.null(summary$cross_modality)) {
-    cat("\n=== Cross-Modality Attention Patterns ===\n")
-    for (pair in names(summary$cross_modality)) {
-      cat(sprintf("\n%s Top Features:\n", toupper(pair)))
-      results <- summary$cross_modality[[pair]]
-      if (!is.null(results)) {
-        for (i in seq_along(results$features)) {
-          cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                     i, results$features[i], results$scores[i]))
-        }
-      }
-    }
-  }
-  
-  if (!is.null(summary$global)) {
-    cat("\n=== Global Attention Patterns ===\n")
-    for (i in seq_along(summary$global$features)) {
-      cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                 i, summary$global$features[i], summary$global$scores[i]))
-    }
-  }
-}
-
-
 
 # Function to create attention heatmaps with appropriate feature name handling
 create_attention_visualizations <- function(attention_results, cv_results, output_dir = "attention_plots") {

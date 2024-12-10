@@ -381,33 +381,6 @@ calculate_binary_metrics <- function(predictions, targets, masks = NULL, thresho
   )
 }
 
-# Helper function to print detailed metrics
-print_detailed_metrics <- function(metrics) {
-  cat("\nDetailed Performance Metrics:\n")
-  cat(sprintf("Accuracy: %.4f\n", metrics$accuracy))
-  cat(sprintf("Balanced Accuracy: %.4f\n", metrics$balanced_accuracy))
-  cat(sprintf("Precision: %.4f\n", metrics$precision))
-  cat(sprintf("Recall (Sensitivity): %.4f\n", metrics$recall))
-  cat(sprintf("Specificity: %.4f\n", metrics$specificity))
-  cat(sprintf("F1 Score: %.4f\n", metrics$f1))
-  cat(sprintf("AUC: %.4f\n", metrics$auc))
-  cat(sprintf("Best Threshold: %.2f\n", metrics$best_threshold))
-  
-  cat("\nClass Balance:\n")
-  cat(sprintf("Positive: %d (%.1f%%)\n", 
-              metrics$class_balance$positive,
-              100 * metrics$class_balance$positive/metrics$n_valid))
-  cat(sprintf("Negative: %d (%.1f%%)\n", 
-              metrics$class_balance$negative,
-              100 * metrics$class_balance$negative/metrics$n_valid))
-  
-  cat("\nConfusion Matrix:\n")
-  cat(sprintf("True Positives: %d\n", metrics$confusion_matrix$tp))
-  cat(sprintf("False Positives: %d\n", metrics$confusion_matrix$fp))
-  cat(sprintf("False Negatives: %d\n", metrics$confusion_matrix$fn))
-  cat(sprintf("True Negatives: %d\n", metrics$confusion_matrix$tn))
-}
-
 
 #' Calculate metrics for survival prediction
 #' @param predictions Model predictions
@@ -779,20 +752,24 @@ subset_datasets <- function(datasets, indices, batch_size = 32) {
 #' Initialize parallel processing environment
 #' @param max_workers Maximum number of parallel workers
 #' @return List containing worker configuration
+
 setup_parallel_env <- function(max_workers) {
     gc()
     available_memory <- as.numeric(system("free -g | awk 'NR==2 {print $4}'", intern=TRUE))
     memory_per_worker <- floor(available_memory / (max_workers + 1))
     actual_workers <- max(1, min(max_workers, floor(available_memory / 2)))
-    
-    plan(multisession, workers = actual_workers)
-    
+
+    plan(multisession,
+         workers = actual_workers,
+         future.seed = TRUE)  # Add this line
+
     list(
         available_memory = available_memory,
         memory_per_worker = memory_per_worker,
         actual_workers = actual_workers
     )
 }
+
 
 #' Process inner cross-validation folds
 #' @param inner_folds List of inner fold indices
@@ -1027,88 +1004,6 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
 
 
 
-#' Analyze feature selection patterns across folds
-#' @param fold_features Nested list of selected features
-#' @return Analysis of feature selection consistency
-analyze_feature_selection <- function(fold_features) {
-    # Initialize storage for feature counts
-    feature_counts <- list()
-    
-    # Process each modality separately
-    modalities <- c("cnv", "clinical", "expression", "mutations", "methylation", "mirna")
-    
-    for (modality in modalities) {
-        # Collect all features selected for this modality
-        all_features <- list()
-        
-        # Process outer folds
-        for (fold in fold_features) {
-            if (!is.null(fold$outer[[modality]])) {
-                all_features <- c(all_features, fold$outer[[modality]])
-            }
-            
-            # Process inner folds
-            for (inner in fold$inner) {
-                if (!is.null(inner[[modality]])) {
-                    all_features <- c(all_features, inner[[modality]])
-                }
-            }
-        }
-        
-        # Calculate feature frequencies
-        if (length(all_features) > 0) {
-            feature_counts[[modality]] <- sort(table(unlist(all_features)), decreasing = TRUE)
-        }
-    }
-    
-    # Calculate summary statistics
-    summary_stats <- lapply(feature_counts, function(counts) {
-        list(
-            n_unique_features = length(counts),
-            top_features = names(head(counts, 10)),
-            feature_frequencies = counts,
-            consistency_score = mean(counts) / max(counts)
-        )
-    })
-    
-    list(
-        feature_counts = feature_counts,
-        summary_stats = summary_stats
-    )
-}
-
-#' Select best model based on validation performance
-#' @param outer_results List of outer fold results containing test performance
-#' @return Best performing model
-select_best_model <- function(outer_results) {
-    # Extract test loss from each outer fold result
-    performances <- sapply(outer_results, function(r) {
-        r$best_val_loss  # Or another metric you prefer like 'f1', 'accuracy', etc.
-    })
-    
-    # Find best performing model
-    best_idx <- which.min(performances)
-    
-    # Return the best model
-    outer_results[[best_idx]]$model
-}
-
-
-#' Select final model from all repeats
-#' @param results List of results from all repeats
-#' @return Best performing model
-select_final_model <- function(results) {
-    performances <- sapply(results, function(r) r$best_val_loss)
-    best_repeat <- which.min(performances)
-    results[[best_repeat]]$best_model
-}
-
-select_final_features <- function(results) {
-    performances <- sapply(results, function(r) r$best_val_loss)
-    best_repeat <- which.min(performances)
-    results[[best_repeat]]$features
-}
-
 #' Aggregate CV results
 #' @param results List of results from all repeats
 #' @return Aggregated results summary with means and standard deviations
@@ -1292,108 +1187,6 @@ evaluate_model <- function(model, data, outcome_type = "binary") {
     }
     
     results
-}
-
-
-# Check if two sets of indices have any overlap
-check_index_overlap <- function(set1, set2) {
-  intersection <- intersect(set1, set2)
-  overlap_pct <- length(intersection) / min(length(set1), length(set2)) * 100
-  list(
-    has_overlap = length(intersection) > 0,
-    overlap_indices = intersection,
-    overlap_percentage = overlap_pct
-  )
-}
-
-# Validate all CV splits
-validate_cv_splits <- function(cv_splits) {
-  validation_results <- list()
-
-  for (r in seq_along(cv_splits)) {
-    repeat_split <- cv_splits[[r]]
-    repeat_results <- list()
-
-    # Check validation vs training/test
-    for (k in seq_along(repeat_split$outer_splits)) {
-      outer_split <- repeat_split$outer_splits[[k]]
-
-      # Check validation vs training
-      val_train_check <- check_index_overlap(
-        repeat_split$validation,
-        outer_split$train_idx
-      )
-
-      # Check validation vs test
-      val_test_check <- check_index_overlap(
-        repeat_split$validation,
-        outer_split$test_idx
-      )
-
-      # Check inner folds
-      inner_fold_results <- list()
-      for (m in seq_along(outer_split$inner_folds)) {
-        inner_fold <- outer_split$inner_folds[[m]]
-
-        # Check inner train vs test
-        inner_check <- check_index_overlap(
-          inner_fold$train_idx,
-          inner_fold$test_idx
-        )
-
-        inner_fold_results[[m]] <- list(
-          fold = m,
-          train_test_overlap = inner_check
-        )
-      }
-
-      repeat_results[[k]] <- list(
-        fold = k,
-        validation_train_overlap = val_train_check,
-        validation_test_overlap = val_test_check,
-        inner_folds = inner_fold_results
-      )
-    }
-
-    validation_results[[r]] <- list(
-      repeatL = r,
-      folds = repeat_results
-    )
-  }
-
-  # Calculate summary statistics
-  total_checks <- 0
-  total_overlaps <- 0
-  max_overlap_pct <- 0
-
-  for (r in validation_results) {
-    for (k in r$folds) {
-      # Count validation checks
-      total_checks <- total_checks + 2  # validation vs train/test
-      if (k$validation_train_overlap$has_overlap) total_overlaps <- total_overlaps + 1
-      if (k$validation_test_overlap$has_overlap) total_overlaps <- total_overlaps + 1
-      max_overlap_pct <- max(max_overlap_pct,
-                           k$validation_train_overlap$overlap_percentage,
-                           k$validation_test_overlap$overlap_percentage)
-
-      # Count inner fold checks
-      for (m in k$inner_folds) {
-        total_checks <- total_checks + 1
-        if (m$train_test_overlap$has_overlap) total_overlaps <- total_overlaps + 1
-        max_overlap_pct <- max(max_overlap_pct, m$train_test_overlap$overlap_percentage)
-      }
-    }
-  }
-
-  list(
-    detailed_results = validation_results,
-    summary = list(
-      total_checks = total_checks,
-      total_overlaps = total_overlaps,
-      overlap_percentage = (total_overlaps / total_checks) * 100,
-      max_overlap_percentage = max_overlap_pct
-    )
-  )
 }
 
 
@@ -1730,48 +1523,6 @@ summarize_attention_patterns <- function(attention_patterns, cv_results) {
   return(summary)
 }
 
-
-# Helper function to extract attention weights
-extract_attention_weights <- function(model, data_batch) {
-  weights <- list()
-
-  # Extract intra-modality attention weights
-  intra_attention <- list()
-  for (modality in names(model$encoders$modules)) {
-    if (!is.null(model$encoders$modules[[modality]]$attention)) {
-      output <- model$encoders$modules[[modality]]$attention(data_batch$data[[modality]])
-      intra_attention[[modality]] <- output$attention_weights$detach()$cpu()
-    }
-  }
-  weights$intra_modality <- intra_attention
-
-  # Extract cross-modality attention weights
-  if (!is.null(model$fusion$cross_attention)) {
-    cross_attention <- list()
-    for (module_name in names(model$fusion$cross_attention$modules)) {
-      parts <- strsplit(module_name, "_to_")[[1]]
-      query_modality <- parts[1]
-      key_modality <- parts[2]
-
-      output <- model$fusion$cross_attention$modules[[module_name]](
-        data_batch$data[[query_modality]],
-        data_batch$data[[key_modality]],
-        data_batch$data[[key_modality]]
-      )
-      cross_attention[[module_name]] <- output$attention_weights$detach()$cpu()
-    }
-    weights$cross_modality <- cross_attention
-  }
-
-  # Extract global attention weights
-  if (!is.null(model$fusion$global_attention)) {
-    output <- model$fusion$forward(data_batch$data)
-    weights$global <- output$attention_weights$detach()$cpu()
-  }
-
-  return(weights)
-
-}
 
 # Helper function to print the summary in a readable format
 print_attention_summary <- function(summary) {
