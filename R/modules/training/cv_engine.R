@@ -972,260 +972,347 @@ run_nested_cv <- function(model, datasets, config, cancer_type,
     final_results <- aggregate_cv_results(results)
     print_cv_results(final_results)
 
-create_attention_matrix <- function(module, feature_names) {
-  n_features <- length(feature_names)
-  
-  # Initialize matrix
-  attention_matrix <- matrix(0, nrow = n_features, ncol = n_features)
-  rownames(attention_matrix) <- feature_names
-  colnames(attention_matrix) <- feature_names
-  
-  # Try to extract weights from query projection
-  tryCatch({
-    if (!is.null(module$to_q)) {
-      weights <- as.matrix(module$to_q$weight$detach()$cpu())
-      attention_matrix <- weights %*% t(weights)
-    }
-  }, error = function(e) {
-    message("Could not extract attention weights: ", e$message)
-  })
-  
-  return(attention_matrix)
+	
+    # Select best model
+    best_repeat_idx <- which.min(sapply(results, function(r) r$best_loss))
+    best_model_results <- list(
+        results = final_results,
+        model = results[[best_repeat_idx]]$best_model,
+        cv_splits = cv_splits,
+        features = results[[best_repeat_idx]]$features,
+        validation_results = results[[best_repeat_idx]]$validation_results,
+        best_loss = results[[best_repeat_idx]]$best_loss,
+    	validation_data = results[[best_repeat_idx]]$validation_data
+    )
+    
+    # Create results directory if it doesn't exist
+    #results_dir <- file.path(config$experiment$output_dir, cancer_type)
+    #if (!dir.exists(results_dir)) {
+    #    dir.create(results_dir, recursive = TRUE)
+    #    message(sprintf("Created results directory: %s", results_dir))
+    #}
+    
+    # Save only the best model results
+    #saveRDS(
+    #    best_model_results,
+    #    file.path(results_dir, "best_model_results.rds")
+    #)
+    #message(sprintf("Saved best model results to: %s", 
+    #               file.path(results_dir, "best_model_results.rds")))
+    
+    return(best_model_results)
 }
 
-# Main function to analyze attention patterns
-analyze_attention_patterns <- function(cv_results) {
-  model <- cv_results$model
-  features <- cv_results$features
-  
-  attention_patterns <- list()
-  
-  # Analyze intra-modality attention
-  intra_modality <- list()
-  for (modality in names(features)) {
-    message("Processing intra-modality attention for: ", modality)
-    if (!is.null(model$encoders$modules[[modality]]$attention)) {
-      intra_modality[[modality]] <- tryCatch({
-        create_attention_matrix(
-          model$encoders$modules[[modality]]$attention,
-          features[[modality]]
+
+#' Aggregate CV results
+#' @param results List of results from all repeats
+#' @return Aggregated results summary with means and standard deviations
+aggregate_cv_results <- function(results) {
+    # Extract validation metrics from each repeat
+    validation_metrics <- lapply(results, function(r) {
+        metrics <- r$validation_results$metrics
+        
+        # Extract numeric metrics
+        main_metrics <- list(
+            accuracy = metrics$accuracy,
+            balanced_accuracy = metrics$balanced_accuracy,
+            precision = metrics$precision,
+            recall = metrics$recall,
+            specificity = metrics$specificity,
+            f1 = metrics$f1,
+            auc = as.numeric(metrics$auc)  # Convert AUC object to numeric
         )
-      }, error = function(e) {
-        message("Error processing intra-modality attention for ", modality, ": ", e$message)
-        return(NULL)
-      })
-    }
-  }
-  attention_patterns$intra_modality <- intra_modality
-  
-  # Analyze cross-modality attention
-  if (!is.null(model$fusion) && !is.null(model$fusion$cross_attention)) {
-    message("Processing cross-modality attention")
-    cross_modality <- list()
-    for (modality1 in names(features)) {
-      for (modality2 in names(features)) {
-        if (modality1 != modality2) {
-          pair_name <- paste0(modality1, "_to_", modality2)
-          if (!is.null(model$fusion$cross_attention$modules[[pair_name]])) {
-            cross_modality[[pair_name]] <- tryCatch({
-              create_attention_matrix(
-                model$fusion$cross_attention$modules[[pair_name]],
-                c(features[[modality1]], features[[modality2]])
-              )
-            }, error = function(e) {
-              message("Error processing cross-modality attention for ", pair_name, ": ", e$message)
-              return(NULL)
-            })
-          }
-        }
-      }
-    }
-    attention_patterns$cross_modality <- cross_modality
-  }
-  
-  # Analyze global attention
-  if (!is.null(model$fusion) && !is.null(model$fusion$global_attention)) {
-    message("Processing global attention")
-    all_features <- unlist(features)
-    attention_patterns$global <- tryCatch({
-      create_attention_matrix(
-        model$fusion$global_attention,
-        all_features
-      )
-    }, error = function(e) {
-      message("Error processing global attention: ", e$message)
-      return(NULL)
+        
+        # Extract class balance
+        class_balance <- list(
+            positive_samples = metrics$class_balance$positive,
+            negative_samples = metrics$class_balance$negative,
+            pos_neg_ratio = metrics$class_balance$positive / metrics$class_balance$negative
+        )
+        
+        # Extract confusion matrix
+        confusion <- list(
+            true_positives = metrics$confusion_matrix$tp,
+            false_positives = metrics$confusion_matrix$fp,
+            false_negatives = metrics$confusion_matrix$fn,
+            true_negatives = metrics$confusion_matrix$tn
+        )
+        
+        list(
+            metrics = main_metrics,
+            class_balance = class_balance,
+            confusion = confusion
+        )
     })
-  }
-  
-  return(attention_patterns)
-}
-
-# Function to visualize attention patterns
-visualize_attention_patterns <- function(attention_patterns) {
-  library(ggplot2)
-  library(reshape2)
-  
-  plots <- list()
-  
-  # Helper function to create heatmap
-  create_heatmap <- function(matrix, title) {
-    if (is.null(matrix)) return(NULL)
     
-    df <- reshape2::melt(matrix)
-    colnames(df) <- c("Feature1", "Feature2", "Weight")
-    
-    ggplot(df, aes(Feature1, Feature2, fill = Weight)) +
-      geom_tile() +
-      scale_fill_gradient2(low = "blue", mid = "white", high = "red",
-                          midpoint = mean(df$Weight)) +
-      theme_minimal() +
-      theme(
-        axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
-        axis.text.y = element_text(size = 6),
-        axis.title = element_text(size = 8),
-        plot.title = element_text(size = 10)
-      ) +
-      labs(title = title)
-  }
-  
-  # Visualize intra-modality attention
-  if (!is.null(attention_patterns$intra_modality)) {
-    for (modality in names(attention_patterns$intra_modality)) {
-      plot <- create_heatmap(
-        attention_patterns$intra_modality[[modality]],
-        paste("Intra-modality Attention:", modality)
-      )
-      if (!is.null(plot)) plots[[paste0("intra_", modality)]] <- plot
+    # Function to compute summary statistics
+    compute_summary <- function(values) {
+        c(
+            mean = mean(unlist(values), na.rm = TRUE),
+            sd = sd(unlist(values), na.rm = TRUE),
+            min = min(unlist(values), na.rm = TRUE),
+            max = max(unlist(values), na.rm = TRUE)
+        )
     }
-  }
-  
-  # Visualize cross-modality attention
-  if (!is.null(attention_patterns$cross_modality)) {
-    for (pair in names(attention_patterns$cross_modality)) {
-      plot <- create_heatmap(
-        attention_patterns$cross_modality[[pair]],
-        paste("Cross-modality Attention:", pair)
-      )
-      if (!is.null(plot)) plots[[paste0("cross_", pair)]] <- plot
-    }
-  }
-  
-  # Visualize global attention
-  if (!is.null(attention_patterns$global)) {
-    plot <- create_heatmap(
-      attention_patterns$global,
-      "Global Attention Patterns"
-    )
-    if (!is.null(plot)) plots$global <- plot
-  }
-  
-  return(plots)
-}
-
-# Function to summarize attention patterns
-summarize_attention_patterns <- function(attention_patterns, cv_results) {
-  summary <- list()
-  
-  # Helper function to get top features
-  get_top_features <- function(matrix, feature_names, n = 10) {
-    if (is.null(matrix)) return(NULL)
     
-    importance <- rowSums(abs(matrix))
-    top_idx <- order(importance, decreasing = TRUE)[1:min(n, length(importance))]
+    # Compute summaries for main metrics
+    metric_names <- names(validation_metrics[[1]]$metrics)
+    metrics_summary <- lapply(metric_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$metrics[[metric]])
+        compute_summary(values)
+    })
+    names(metrics_summary) <- metric_names
     
+    # Compute summaries for class balance
+    balance_names <- names(validation_metrics[[1]]$class_balance)
+    balance_summary <- lapply(balance_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$class_balance[[metric]])
+        compute_summary(values)
+    })
+    names(balance_summary) <- balance_names
+    
+    # Compute summaries for confusion matrix
+    confusion_names <- names(validation_metrics[[1]]$confusion)
+    confusion_summary <- lapply(confusion_names, function(metric) {
+        values <- sapply(validation_metrics, function(x) x$confusion[[metric]])
+        compute_summary(values)
+    })
+    names(confusion_summary) <- confusion_names
+    
+    # Return organized results
     list(
-      features = feature_names[top_idx],
-      scores = importance[top_idx]
+        performance = list(
+            metrics = metrics_summary,
+            class_balance = balance_summary,
+            confusion = confusion_summary
+        ),
+        n_repeats = length(results),
+        n_samples = results[[1]]$validation_results$metrics$n_valid
     )
-  }
-  
-  # Summarize intra-modality attention
-  if (!is.null(attention_patterns$intra_modality)) {
-    summary$intra_modality <- list()
-    for (modality in names(attention_patterns$intra_modality)) {
-      summary$intra_modality[[modality]] <- get_top_features(
-        attention_patterns$intra_modality[[modality]],
-        cv_results$features[[modality]]
-      )
+}
+#' Print formatted CV results
+#' @param results Aggregated CV results
+#' @export
+print_cv_results <- function(results) {
+    cat("\n=== Cross-Validation Results ===")
+    cat(sprintf("\nNumber of repeats: %d", results$n_repeats))
+    cat(sprintf("\nNumber of samples: %d", results$n_samples))
+    
+    # Print main metrics
+    cat("\n\n=== Performance Metrics ===")
+    for(metric in names(results$performance$metrics)) {
+        stats <- results$performance$metrics[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.4f ± %.4f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.4f, %.4f]", stats["min"], stats["max"]))
+    }
+    
+    # Print class balance
+    cat("\n\n=== Class Balance ===")
+    for(metric in names(results$performance$class_balance)) {
+        stats <- results$performance$class_balance[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.2f ± %.2f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.2f, %.2f]", stats["min"], stats["max"]))
+    }
+    
+    # Print confusion matrix
+    cat("\n\n=== Confusion Matrix Statistics ===")
+    for(metric in names(results$performance$confusion)) {
+        stats <- results$performance$confusion[[metric]]
+        cat(sprintf("\n%s:", gsub("_", " ", toupper(metric))))
+        cat(sprintf("\n  Mean ± SD: %.2f ± %.2f", stats["mean"], stats["sd"]))
+        cat(sprintf("\n  Range: [%.2f, %.2f]", stats["min"], stats["max"]))
+    }
+    cat("\n")
+}
+#' Evaluate model performance
+#' @param model Trained model
+#' @param data Test data (MultiModalDataset)
+#' @param outcome_type Either "binary" or "survival"
+#' @return List of evaluation metrics and predictions
+evaluate_model <- function(model, data, outcome_type = "binary") {
+    model$eval()
+    loader <- dataloader(dataset = data, batch_size = 32, shuffle = FALSE, collate_fn = custom_collate)
+    
+    predictions <- list()
+    targets <- list()
+    times <- list()
+    events <- list()
+    
+    with_no_grad({
+        coro::loop(for (batch in loader) {
+            output <- model(batch$data)
+            predictions[[length(predictions) + 1]] <- output$predictions$cpu()
+            
+            if (outcome_type == "binary") {
+                # Extract binary outcome tensor
+                if (!is.null(batch$outcomes$binary)) {
+                    targets[[length(targets) + 1]] <- batch$outcomes$binary$unsqueeze(2)$cpu()
+                } else {
+                    stop("Binary outcomes not found in batch")
+                }
+            } else {
+                times[[length(times) + 1]] <- batch$time$cpu()
+                events[[length(events) + 1]] <- batch$event$cpu()
+            }
+        })
+    })
+    
+    all_predictions <- torch_cat(predictions, dim = 1)
+    
+    if (outcome_type == "binary") {
+        # Stack all target tensors
+        all_targets <- torch_cat(targets, dim = 1)
+        metrics <- calculate_binary_metrics(all_predictions, all_targets)
+        
+        results <- list(
+            metrics = metrics,
+            predictions = all_predictions,
+            targets = all_targets
+        )
+    } else {
+        all_times <- torch_cat(times, dim = 1)
+        all_events <- torch_cat(events, dim = 1)
+        metrics <- calculate_survival_metrics(all_predictions, all_times, all_events)
+        
+        results <- list(
+            metrics = metrics,
+            predictions = all_predictions,
+            times = all_times,
+            events = all_events
+        )
+    }
+    
+    results
+}
+# Function to safely calculate mean
+  safe_mean <- function(x) {
+    if (is.numeric(x)) {
+      return(mean(x, na.rm = TRUE))
+    } else if (is.list(x)) {
+      return(x[[length(x)]])  # Take the last value for lists
+    } else {
+      return(NA)
     }
   }
-  
-  # Summarize cross-modality attention
-  if (!is.null(attention_patterns$cross_modality)) {
-    summary$cross_modality <- list()
-    for (pair in names(attention_patterns$cross_modality)) {
-      # Extract modality names from pair
-      modalities <- strsplit(pair, "_to_")[[1]]
-      source_modality <- modalities[1]
-      target_modality <- modalities[2]
-      
-      # Combine feature names in the correct order
-      combined_features <- c(
-        cv_results$features[[source_modality]],
-        cv_results$features[[target_modality]]
-      )
-      
-      summary$cross_modality[[pair]] <- get_top_features(
-        attention_patterns$cross_modality[[pair]],
-        combined_features
-      )
+  # Function to safely get class balance
+  get_class_balance <- function(metrics) {
+    if (is.null(metrics$class_balance)) return(NULL)
+    if (is.list(metrics$class_balance)) {
+      last_balance <- metrics$class_balance[[length(metrics$class_balance)]]
+      if (is.list(last_balance)) {
+        return(last_balance)
+      }
+    }
+    return(NULL)
+  }
+#' Prepare validation data using exact feature matching
+#' @param model Trained model
+#' @param validation_data Validation dataset
+#' @param selected_features List of features by modality
+#' @return Validation data with exactly matched features
+prepare_validation_features <- function(model, validation_data, selected_features) {
+  selected_data <- validation_data
+  for (modality in names(selected_features)) {
+    if (!is.null(validation_data$data[[modality]])) {
+      feature_cols <- c("sample_id", selected_features[[modality]])
+      available_cols <- colnames(validation_data$data[[modality]])
+      missing_cols <- setdiff(feature_cols, available_cols)
+      if (length(missing_cols) > 0) {
+        stop(sprintf("Missing %s columns: %s",
+                    modality,
+                    paste(missing_cols[1:min(5, length(missing_cols))], collapse=", ")))
+      }
+      selected_data$data[[modality]] <- validation_data$data[[modality]][, feature_cols]
+      selected_data$features[[modality]] <- selected_features[[modality]]
+      cat(sprintf("%s: selected %d features\n", modality, length(selected_features[[modality]])))
     }
   }
-  
-  # Summarize global attention
-  if (!is.null(attention_patterns$global)) {
-    # Combine all features in the correct order
-    all_features <- unlist(cv_results$features)
-    summary$global <- get_top_features(
-      attention_patterns$global,
-      all_features
-    )
+  return(selected_data)
+}
+#' Create training validation split for outer fold
+#' @param indices Vector of training indices
+#' @param validation_split Proportion for validation (between 0 and 1)
+#' @param stratify Optional stratification vector
+#' @return List containing train and validation indices
+create_train_val_split <- function(indices, validation_split, stratify = NULL) {
+  n_total <- length(indices)
+  n_val <- floor(n_total * validation_split)
+  if (!is.null(stratify)) {
+    # Get stratification values for these indices
+    val_indices <- create_stratified_split(indices, stratify, n_val)
+  } else {
+    # Random sampling
+    val_indices <- sample(indices, n_val)
   }
-  
-  return(summary)
+  train_indices <- setdiff(indices, val_indices)
+  list(
+    train = train_indices,
+    validation = val_indices
+  )
+}
+analyze_feature_importance <- function(model, selected_features, top_n = 20) {
+  importance_by_modality <- list()
+  # Extract weights from first layer of each encoder
+  for (modality in names(model$modality_dims)) {
+    # Get first layer weights
+    weights <- model$encoders$modules[[modality]]$layers[[1]][[1]]$weight$cpu()
+    weights_matrix <- as.matrix(weights)
+    # Calculate importance scores (mean absolute weight)
+    importance_scores <- colMeans(abs(weights_matrix))
+    # Match with feature names
+    features <- selected_features[[modality]]
+    if (length(features) == length(importance_scores)) {
+      importance_df <- data.frame(
+        feature = features,
+        importance = importance_scores,
+        modality = modality
+      )
+      # Sort by importance
+      importance_df <- importance_df[order(-importance_df$importance), ]
+      importance_by_modality[[modality]] <- importance_df
+    }
+  }
+  # Print top features for each modality
+  for (modality in names(importance_by_modality)) {
+    cat(sprintf("\nTop %d %s features:\n", top_n, modality))
+    df <- head(importance_by_modality[[modality]], top_n)
+    print(df[, c("feature", "importance")])
+  }
+  return(importance_by_modality)
 }
 
 
-# Helper function to print the summary in a readable format
-print_attention_summary <- function(summary) {
-  # Print intra-modality results
-  if (!is.null(summary$intra_modality)) {
-    cat("\n=== Intra-Modality Attention Patterns ===\n")
-    for (modality in names(summary$intra_modality)) {
-      cat(sprintf("\n%s Top Features:\n", toupper(modality)))
-      results <- summary$intra_modality[[modality]]
-      if (!is.null(results)) {
-        for (i in seq_along(results$features)) {
-          cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                     i, results$features[i], results$scores[i]))
-        }
+
+#' Prepare validation data using exact feature matching
+#' @param model Trained model
+#' @param validation_data Validation dataset
+#' @param selected_features List of features by modality
+#' @return Validation data with exactly matched features
+prepare_validation_features <- function(model, validation_data, selected_features) {
+  selected_data <- validation_data
+
+  for (modality in names(selected_features)) {
+    if (!is.null(validation_data$data[[modality]])) {
+      feature_cols <- c("sample_id", selected_features[[modality]])
+      available_cols <- colnames(validation_data$data[[modality]])
+      missing_cols <- setdiff(feature_cols, available_cols)
+
+      if (length(missing_cols) > 0) {
+        stop(sprintf("Missing %s columns: %s",
+                    modality,
+                    paste(missing_cols[1:min(5, length(missing_cols))], collapse=", ")))
       }
+
+      selected_data$data[[modality]] <- validation_data$data[[modality]][, feature_cols]
+      selected_data$features[[modality]] <- selected_features[[modality]]
+
+      cat(sprintf("%s: selected %d features\n", modality, length(selected_features[[modality]])))
     }
   }
 
-  # Print cross-modality results
-  if (!is.null(summary$cross_modality)) {
-    cat("\n=== Cross-Modality Attention Patterns ===\n")
-    for (pair in names(summary$cross_modality)) {
-      cat(sprintf("\n%s Top Features:\n", toupper(pair)))
-      results <- summary$cross_modality[[pair]]
-      if (!is.null(results)) {
-        for (i in seq_along(results$features)) {
-          cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                     i, results$features[i], results$scores[i]))
-        }
-      }
-    }
-  }
-
-  # Print global attention results
-  if (!is.null(summary$global)) {
-    cat("\n=== Global Attention Patterns ===\n")
-    for (i in seq_along(summary$global$features)) {
-      cat(sprintf("%2d. %-50s (Score: %.4f)\n",
-                 i, summary$global$features[i], summary$global$scores[i]))
-    }
-  }
+  return(selected_data)
 }
+
 

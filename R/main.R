@@ -191,8 +191,8 @@ main <- function(download=FALSE) {
          title = "Top 20 Most Important Features Across Modalities"))
 	dev.off()
 	
-	str(attention_results)
-	str(cv_results)
+	#str(attention_results)
+	#str(cv_results)
     	
 	create_attention_visualizations(attention_results, cv_results)
         #saveRDS(cv_results, "cv_results.rds")
