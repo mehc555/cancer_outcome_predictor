@@ -1,7 +1,8 @@
 # config.yml
+
 experiment:
   name: "multimodal_cancer_prediction"
-  output_dir: "results/experiments"
+  output_dir: "results/"
 
 cv_params:
   outer_repeats: 2

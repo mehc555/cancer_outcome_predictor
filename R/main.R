@@ -1,10 +1,7 @@
 # R/main.R
 
-library(ggplot2)
+#library(ggplot2)
 options(future.globals.maxSize = 12000 * 1024^2)
-
-# Source base setup
-source("R/setup.R")
 
 # Source required modules
 source("R/modules/data_handling/download_processor.R")
@@ -16,10 +13,14 @@ source("R/modules/data_handling/methylation_processor.R")
 source("R/modules/data_handling/mirna_processor.R")
 source("R/modules/data_handling/multimodal_dataset.R")
 source("R/modules/helper_functions/misc.R")
+source("R/modules/helper_functions/feature_importance.R")
 source("R/modules/models/torch_models.R")
-source("R/modules/training/cv_engine.R")
 source("R/modules/training/feature_selection.R")
+source("R/modules/training/cv_engine.R")
 source("R/modules/training/hyperparameter_optimization.R")
+
+
+
 seed=123
 set.seed(seed)
   
@@ -37,15 +38,12 @@ future::plan(future::multisession, future.seed=TRUE)
 
 
 main <- function(download=FALSE) {
-    # Initialize project and load config
-    if (!exists("config")) {
-        initialize_project()
-        config <- load_config()
-    }
+    # Load config
+    config=yaml::read_yaml(file.path("configs/config.yml")) 
     
     # Download data
-    if(!download) {
-    	#download_tcga_data()
+    if(download) {
+    	download_tcga_data()
     }
     # Define cancer types
     #cancer_types <- c("BRCA", "COAD", "LUAD")
@@ -114,6 +112,7 @@ main <- function(download=FALSE) {
 
         # Outcome information
 
+	saveRDS(processed_data,"processed_data.rds")
 
         outcome_info <- list(
  	type = "binary",
@@ -180,34 +179,31 @@ main <- function(download=FALSE) {
   	all_importance <- do.call(rbind, importance_results)
 	
 	print_attention_summary(attention_summary)
-
+	
+	pdf("test.pdf", width=12)
   	# Plot top 20 features across all modalities
-  	ggplot(head(all_importance[order(-all_importance$importance), ], 50),
+  	print(ggplot(head(all_importance[order(-all_importance$importance), ], 50),
         	 aes(x = reorder(feature, importance), y = importance, fill = modality)) +
     	geom_bar(stat = "identity") +
     	coord_flip() +
     	theme_minimal() +
    	 labs(x = "Feature", y = "Importance Score",
-         title = "Top 20 Most Important Features Across Modalities")
+         title = "Top 20 Most Important Features Across Modalities"))
+	dev.off()
 	
-	
-    	create_attention_visualizations(attention_results, cv_results)
-
-        # Save results
-        results_dir <- file.path(config$main$paths$results_dir, cancer_type)
-        dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
-        
-        saveRDS(
-            cv_results,
-            file.path(results_dir, "cv_results.rds")
-        )
+	str(attention_results)
+	str(cv_results)
+    	
+	create_attention_visualizations(attention_results, cv_results)
+        #saveRDS(cv_results, "cv_results.rds")
         
         # Log completion
         logger::log_info("Completed processing for cancer type: {cancer_type}")
+    
     }
     
-    #return(processed_data)
+    return(cv_results)
 }
 
-main()
+cv_results=main()
 
